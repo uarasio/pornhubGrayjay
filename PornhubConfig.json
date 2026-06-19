@@ -1,14 +1,14 @@
 {
 	"name": "PornHub",
-	"description": "Basic PornHub plugin for Grayjay",
+	"description": "PornHub plugin for Grayjay - search, channels, comments, recommendations, login, history & migration",
 	"author": "mr. X",
 	"authorUrl": "",
-	"platformUrl":"https://www.pornhub.com",
-	
+	"platformUrl": "https://www.pornhub.com",
+
 	"sourceUrl": "https://raw.githubusercontent.com/uarasio/pornhubGrayjay/refs/heads/main/PornhubConfig.json",
 	"repositoryUrl": "https://github.com/uarasio/pornhubGrayjay/",
 	"scriptUrl": "./PornhubScript.js",
-	"version": 11,
+	"version": 12,
 
 	"scriptPublicKey": "",
 	"scriptSignature": "",
@@ -16,13 +16,40 @@
 	"iconUrl": "./pornhub.png",
 	"id": "dce06efc-862e-11ee-b9d1-0242ac120002",
 
-	"packages": ["Http", "DOMParser"],
+	"packages": ["Http", "DOMParser", "Utilities"],
 	"allowAllHttpHeaderAccess": true,
 	"allowEval": true,
 	"allowUrls": [
-		".pornhub.com"
+		".pornhub.com",
+		"pornhub.com",
+		"www.pornhub.com",
+		"ev.phncdn.com",
+		".phncdn.com"
 	],
+
+	"authentication": {
+		"userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:143.0) Gecko/20100101 Firefox/143.0",
+		"loginUrl": "https://www.pornhub.com/login",
+		"cookiesToFind": ["il"],
+		"cookiesExclOthers": false
+	},
+
+	"settings": [],
+
+	"supportedClaimTypes": [3],
+	"primaryClaimFieldType": 3,
+	"subscriptionRateLimit": 60,
+
 	"changelog": {
+		"12": [
+			"Added Sign-in support (Grayjay built-in login web view);",
+			"Added Import of subscribed pornstars / models / channels;",
+			"Added Import of user playlists, plus virtual Favorites & Watch Later;",
+			"Added Sync of remote watch history (Pornhub -> Grayjay);",
+			"Added Search filters: Date, Duration, Quality (HD), Production, Sort order;",
+			"Added Search types: Videos, Playlists, Creators;",
+			"Added Playlist URL handling and full playlist details;"
+		],
 		"11": [
 			"Fix playing videos, isChannelUrl check;",
 			"Fix loading some channels;"

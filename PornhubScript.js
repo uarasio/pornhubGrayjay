@@ -7,7 +7,14 @@ const PLATFORM = "PornHub";
 var config = {};
 var state = {
 	token: "",
-	sessionCookie: ""
+	sessionCookie: "",
+	// Auth state populated by the login flow / isLoggedIn().
+	isAuthenticated: false,
+	username: "",
+	userId: ""
+};
+var pluginSettings = {
+	syncRemoteHistory: true
 };
 
 // headers (including cookie by default, since it's used for each session later)
@@ -19,6 +26,12 @@ var headers = {
 	"Cache-Control": "no-cache",
 	"Upgrade-Insecure-Requests": "1"
 };
+
+// Auth cookies that indicate a successfully logged-in pornhub session. `il`
+// is set as part of the persistent login token, `phn` is the persistent
+// username hash. Presence of either is treated as logged-in; the session is
+// re-verified against /front_page to fetch the actual username.
+const AUTH_COOKIE_NAMES = ["il", "phn"];
 
 /**
  * Build a query
@@ -48,18 +61,63 @@ function buildQuery(params) {
 source.enable = function (conf, settings, savedStateStr) {
 	config = conf ?? {};
 
+	if (settings && typeof settings.syncRemoteHistory !== "undefined") {
+		const v = settings.syncRemoteHistory;
+		pluginSettings.syncRemoteHistory = (v === true) || (typeof v === "string" && v.toLowerCase() === "true");
+	}
+
 	if (savedStateStr) {
 		try {
-			state = JSON.parse(savedStateStr);
-			log("State loaded: token=" + (state.token ? "present" : "empty"));
+			const s = JSON.parse(savedStateStr);
+			state.token = s.token || "";
+			state.sessionCookie = s.sessionCookie || "";
+			state.isAuthenticated = !!s.isAuthenticated;
+			state.username = s.username || "";
+			state.userId = s.userId || "";
+			log("State loaded: token=" + (state.token ? "present" : "empty") + " auth=" + state.isAuthenticated);
 		} catch (e) {
 			log("Failed to parse saved state: " + e);
 		}
 	}
+
+	// If Grayjay tells us the user is logged in (via its built-in bridge), trust it.
+	try {
+		if (typeof bridge !== "undefined" && bridge && typeof bridge.isLoggedIn === "function" && bridge.isLoggedIn()) {
+			state.isAuthenticated = true;
+		}
+	} catch (e) { /* ignore */ }
+};
+
+source.disable = function () {
+	state.isAuthenticated = false;
+	state.username = "";
+	state.userId = "";
+};
+
+source.setSettings = function (newsettings) {
+	if (!newsettings) return;
+	if (typeof newsettings.syncRemoteHistory !== "undefined") {
+		const v = newsettings.syncRemoteHistory;
+		pluginSettings.syncRemoteHistory = (v === true) || (typeof v === "string" && v.toLowerCase() === "true");
+	}
 };
 
 source.saveState = function() {
-	return JSON.stringify(state);
+	return JSON.stringify({
+		token: state.token,
+		sessionCookie: state.sessionCookie,
+		isAuthenticated: state.isAuthenticated,
+		username: state.username,
+		userId: state.userId
+	});
+};
+
+source.getCapabilities = function () {
+	// Kept for completeness; Grayjay detects history sync support purely by
+	// the presence of source.getUserHistory below.
+	return {
+		hasSyncRemoteWatchHistory: pluginSettings.syncRemoteHistory
+	};
 };
 
 source.getHome = function () {
@@ -133,32 +191,175 @@ source.searchSuggestions = function(query) {
 	}
 };
 
+// ---------- search constants ----------
+
+const SORT_OPTIONS = ["Relevance", "Most Recent", "Most Viewed", "Top Rated", "Longest"];
+const SORT_MAP = {
+	"Relevance":    "",
+	"Most Recent":  "mr",
+	"Most Viewed":  "mv",
+	"Top Rated":    "tr",
+	"Longest":      "lg"
+};
+// `period=` filter values used by pornhub's /video/search endpoint.
+const DATE_MAP = {
+	"today":  "t",
+	"week":   "w",
+	"month":  "m",
+	"year":   "y",
+	"all":    "a"
+};
+// Duration filter: `min_duration` / `max_duration` in minutes.
+const DURATION_MAP = {
+	"short":  { min_duration: 0,  max_duration: 10 },
+	"medium": { min_duration: 10, max_duration: 20 },
+	"long":   { min_duration: 20, max_duration: 30 },
+	"vlong":  { min_duration: 30 }
+};
+// Production filter -> `p=` query parameter
+const PRODUCTION_MAP = {
+	"professional": "professional",
+	"homemade":     "homemade"
+};
+
+// Popular pornhub category IDs (used by `cat=` query parameter on /video/search).
+// Mirrors the way HV-GJ exposes a multi-select "Category" filter.
+const CATEGORY_FILTERS = [
+	{ name: "Any",           value: ""   },
+	{ name: "Amateur",       value: "3"  },
+	{ name: "Anal",          value: "35" },
+	{ name: "Asian",         value: "1"  },
+	{ name: "Babe",          value: "4"  },
+	{ name: "Big Ass",       value: "6"  },
+	{ name: "Big Tits",      value: "7"  },
+	{ name: "Blonde",        value: "9"  },
+	{ name: "Blowjob",       value: "13" },
+	{ name: "Brunette",      value: "10" },
+	{ name: "Cartoon",       value: "57" },
+	{ name: "Cosplay",       value: "115"},
+	{ name: "Creampie",      value: "15" },
+	{ name: "Cumshot",       value: "16" },
+	{ name: "Ebony",         value: "2"  },
+	{ name: "Fetish",        value: "20" },
+	{ name: "Gangbang",      value: "55" },
+	{ name: "Hardcore",      value: "27" },
+	{ name: "Hentai",        value: "60" },
+	{ name: "Interracial",   value: "29" },
+	{ name: "Japanese",      value: "111"},
+	{ name: "Latina",        value: "30" },
+	{ name: "Lesbian",       value: "31" },
+	{ name: "MILF",          value: "33" },
+	{ name: "Pornstar",      value: "37" },
+	{ name: "POV",           value: "41" },
+	{ name: "Public",        value: "42" },
+	{ name: "Reality",       value: "5"  },
+	{ name: "Red Head",      value: "21" },
+	{ name: "Rough Sex",     value: "94" },
+	{ name: "Squirt",        value: "67" },
+	{ name: "Teen (18+)",    value: "14" },
+	{ name: "Threesome",     value: "53" },
+	{ name: "Toys",          value: "23" },
+	{ name: "Verified Amateurs", value: "139" },
+	{ name: "Vintage",       value: "61" },
+	{ name: "Webcam",        value: "26" }
+];
+
 source.getSearchCapabilities = () => {
 	return {
-		types: [Type.Feed.Mixed],
-		sorts: [Type.Order.Chronological],
-		filters: []
+		// Only video feed types here so Grayjay shows the filter/sort UI on the
+		// Videos tab. Channels/Playlists searches happen via dedicated entry
+		// points (searchChannels / searchPlaylists).
+		types: [Type.Feed.Mixed, Type.Feed.Videos],
+		sorts: SORT_OPTIONS,
+		filters: [
+			{
+				id: "date",
+				name: "Date",
+				isMultiSelect: false,
+				filters: [
+					{ name: "Any time",     value: ""      },
+					{ name: "Today",        value: "today" },
+					{ name: "This week",    value: "week"  },
+					{ name: "This month",   value: "month" },
+					{ name: "This year",    value: "year"  }
+				]
+			},
+			{
+				id: "duration",
+				name: "Duration",
+				isMultiSelect: false,
+				filters: [
+					{ name: "Any",          value: ""        },
+					{ name: "0-10 min",     value: "short"   },
+					{ name: "10-20 min",    value: "medium"  },
+					{ name: "20-30 min",    value: "long"    },
+					{ name: "30+ min",      value: "vlong"   }
+				]
+			},
+			{
+				id: "quality",
+				name: "Quality",
+				isMultiSelect: false,
+				filters: [
+					{ name: "Any",          value: ""   },
+					{ name: "HD",           value: "hd" }
+				]
+			},
+			{
+				id: "production",
+				name: "Production",
+				isMultiSelect: false,
+				filters: [
+					{ name: "Any",          value: ""             },
+					{ name: "Professional", value: "professional" },
+					{ name: "Homemade",     value: "homemade"     }
+				]
+			},
+			{
+				id: "category",
+				name: "Category",
+				isMultiSelect: false,
+				filters: CATEGORY_FILTERS
+			}
+		]
 	};
 };
 
-source.search = function (query, type, order, filters) {
-	//let sort = order;
-	//if (sort === Type.Order.Chronological) {
-	//	sort = "-publishedAt";
-	//}
-//
-	//const params = {
-	//	search: query,
-	//	sort
-	//};
-//
-	//if (type == Type.Feed.Streams) {
-	//	params.isLive = true;
-	//} else if (type == Type.Feed.Videos) {
-	//	params.isLive = false;
-	//}
+function _pickFilter(filters, id) {
+	if (!filters) return null;
+	const v = filters[id];
+	if (Array.isArray(v)) return v.length ? v[0] : null;
+	return v || null;
+}
 
-	return getVideoPager("/video/search", {search: query}, 1);
+function buildSearchFilterParams(order, filters) {
+	const out = {};
+	if (order && SORT_MAP[order] !== undefined && SORT_MAP[order] !== "") {
+		out.o = SORT_MAP[order];
+	}
+	if (filters && typeof filters === "object") {
+		const date = _pickFilter(filters, "date");
+		if (date && DATE_MAP[date]) out.period = DATE_MAP[date];
+		const dur = _pickFilter(filters, "duration");
+		if (dur && DURATION_MAP[dur]) Object.assign(out, DURATION_MAP[dur]);
+		const q = _pickFilter(filters, "quality");
+		if (q === "hd") out.hd = 1;
+		const prod = _pickFilter(filters, "production");
+		if (prod && PRODUCTION_MAP[prod]) out.p = PRODUCTION_MAP[prod];
+		const cat = _pickFilter(filters, "category");
+		if (cat) out.cat = cat;
+	}
+	return out;
+}
+
+source.search = function (query, type, order, filters) {
+	// Route by feed type. Channels & Playlists have dedicated entry points.
+	if (type === Type.Feed.Channels) return source.searchChannels(query);
+	if (type === Type.Feed.Playlists) return source.searchPlaylists(query);
+
+	const extra = buildSearchFilterParams(order, filters);
+	const params = Object.assign({ search: query }, extra);
+	return getVideoPager("/video/search", params, 1);
 };
 
 source.getSearchChannelContentsCapabilities = function () {
@@ -721,6 +922,21 @@ function refreshSession() {
 		// Build the complete cookie string
 		// Start with required cookies
 		var cookieString = "platform=pc; accessAgeDisclaimerPH=2";
+
+		// Preserve any auth cookies that were captured by Grayjay's
+		// login web view (il, phn, etc) -- without these, the user
+		// appears logged-out after a session refresh.
+		try {
+			var prev = headers["Cookie"] || "";
+			prev.split(";").forEach(function (p) {
+				var part = p.trim();
+				if (!part) return;
+				var name = part.split("=")[0];
+				if (AUTH_COOKIE_NAMES.indexOf(name) >= 0) {
+					cookieString += "; " + part;
+				}
+			});
+		} catch (e) { /* ignore */ }
 
 		// Add cookies from response headers (__l, __s, etc.)
 		for (var i = 0; i < cookiesFromHeaders.length; i++) {
@@ -2219,11 +2435,745 @@ function parseNumberSuffix(numStr) {
 }
 
 function parseDuration(durationStr) {
-	var splitted = durationStr.split(":");
-	var mins = parseInt(splitted[0]);
-	var secs = parseInt(splitted[1]);
-
-	return 60 * mins + secs;
+	if (!durationStr) return 0;
+	var splitted = String(durationStr).trim().split(":");
+	if (splitted.length === 2) {
+		var mins = parseInt(splitted[0]) || 0;
+		var secs = parseInt(splitted[1]) || 0;
+		return 60 * mins + secs;
+	}
+	if (splitted.length === 3) {
+		var hrs = parseInt(splitted[0]) || 0;
+		var mns = parseInt(splitted[1]) || 0;
+		var scs = parseInt(splitted[2]) || 0;
+		return 3600 * hrs + 60 * mns + scs;
+	}
+	return parseInt(durationStr) || 0;
 }
+
+// ====================================================================
+// Authentication (login / logout / session detection)
+// ====================================================================
+
+function hasValidAuthCookie(cookies) {
+	if (!cookies) return false;
+	if (typeof cookies === "string") {
+		if (!cookies.length) return false;
+		for (var i = 0; i < AUTH_COOKIE_NAMES.length; i++) {
+			if (cookies.indexOf(AUTH_COOKIE_NAMES[i] + "=") >= 0) return true;
+		}
+		return false;
+	}
+	if (Array.isArray(cookies)) {
+		for (var j = 0; j < cookies.length; j++) {
+			var c = cookies[j];
+			if (c && c.name && AUTH_COOKIE_NAMES.indexOf(c.name) >= 0) return true;
+		}
+		return false;
+	}
+	if (typeof cookies === "object") {
+		for (var k in cookies) {
+			if (cookies[k] && AUTH_COOKIE_NAMES.indexOf(k) >= 0) return true;
+		}
+		return false;
+	}
+	return false;
+}
+
+function cookiesToString(cookies) {
+	if (!cookies) return "";
+	if (typeof cookies === "string") return cookies;
+	if (Array.isArray(cookies)) {
+		return cookies.filter(c => c && c.name && c.value)
+			.map(c => c.name + "=" + c.value).join("; ");
+	}
+	if (typeof cookies === "object") {
+		var out = [];
+		for (var k in cookies) { if (cookies[k]) out.push(k + "=" + cookies[k]); }
+		return out.join("; ");
+	}
+	return "";
+}
+
+// Loads whatever cookies Grayjay captured for pornhub.com after the login
+// flow, and merges any auth cookies into the shared `headers["Cookie"]` so
+// subsequent http.GET calls (which use those headers) are authenticated.
+function loadAuthCookies() {
+	var captured = "";
+	try {
+		if (typeof http.getCookies === "function") {
+			var ck = http.getCookies(URL_BASE);
+			if (hasValidAuthCookie(ck)) captured = cookiesToString(ck);
+		}
+		if (!captured && typeof bridge !== "undefined" && bridge) {
+			if (typeof bridge.getCookieString === "function") {
+				var s = bridge.getCookieString(URL_BASE);
+				if (hasValidAuthCookie(s)) captured = s;
+			}
+			if (!captured && typeof bridge.getCookies === "function") {
+				try {
+					var c2 = bridge.getCookies("pornhub.com");
+					if (hasValidAuthCookie(c2)) captured = cookiesToString(c2);
+				} catch (e) { /* ignore */ }
+			}
+		}
+	} catch (e) { log("loadAuthCookies error: " + e); }
+	if (captured) {
+		// Merge captured auth cookies into the default request headers cookie
+		// string. We keep the existing platform=pc / accessAgeDisclaimerPH=2
+		// cookies (needed by many endpoints) and append anything new.
+		try {
+			var existing = headers["Cookie"] || "";
+			var existingNames = {};
+			existing.split(";").forEach(function(p) {
+				var kv = p.trim().split("=");
+				if (kv[0]) existingNames[kv[0]] = true;
+			});
+			captured.split(";").forEach(function(p) {
+				var part = p.trim();
+				if (!part) return;
+				var name = part.split("=")[0];
+				if (!existingNames[name]) {
+					existing += (existing ? "; " : "") + part;
+					existingNames[name] = true;
+				}
+			});
+			headers["Cookie"] = existing;
+		} catch (e) { log("loadAuthCookies merge error: " + e); }
+		return true;
+	}
+	return false;
+}
+
+// Parse the logged-in username from a fetched pornhub HTML page. Pornhub
+// exposes the current user via the top-bar dropdown (`a.username`) and via a
+// meta tag (`name="USR"`) on most pages.
+function parseUsernameFromHtml(html) {
+	try {
+		var dom = domParser.parseFromString(html);
+		var meta = dom.querySelector("meta[name='USR']") || dom.querySelector("meta[name='userId']");
+		if (meta && meta.getAttribute("content")) {
+			var v = meta.getAttribute("content").trim();
+			if (v && v.toLowerCase() !== "guest" && v !== "0") {
+				return v;
+			}
+		}
+		var a = dom.querySelector("a.username, a#headerUsername, li#headerUsername a");
+		if (a) {
+			var name = a.textContent.trim();
+			if (name && name.toLowerCase() !== "log in" && name.toLowerCase() !== "sign in") {
+				return name;
+			}
+		}
+		// fallback: look for /users/<name>/ link in header
+		var profileLink = dom.querySelector("a[href*='/users/'][href*='/account']");
+		if (profileLink) {
+			var href = profileLink.getAttribute("href") || "";
+			var m = href.match(/\/users\/([^\/\?#]+)/);
+			if (m) return m[1];
+		}
+	} catch (e) { /* ignore */ }
+	return "";
+}
+
+// Authoritative session probe: fetch the home page (which renders different
+// HTML depending on auth) and extract the logged-in username. Populates
+// state.username when successful.
+function validateSession() {
+	try {
+		var resp = http.GET(URL_BASE + "/front", headers, true);
+		if (!resp || !resp.isOk) {
+			resp = http.GET(URL_BASE + "/", headers, true);
+		}
+		if (!resp || !resp.isOk) return false;
+		var u = parseUsernameFromHtml(resp.body);
+		if (u) {
+			state.username = u;
+			return true;
+		}
+	} catch (e) { log("validateSession error: " + e); }
+	return false;
+}
+
+function bridgeIsLoggedIn() {
+	try {
+		if (typeof bridge !== "undefined" && bridge && typeof bridge.isLoggedIn === "function") {
+			return !!bridge.isLoggedIn();
+		}
+	} catch (e) { /* ignore */ }
+	return false;
+}
+
+source.isLoggedIn = function () {
+	try {
+		if (bridgeIsLoggedIn()) {
+			loadAuthCookies();
+			state.isAuthenticated = true;
+			if (!state.username) validateSession();
+			return true;
+		}
+		loadAuthCookies();
+		if (validateSession()) {
+			state.isAuthenticated = true;
+			return true;
+		}
+		state.isAuthenticated = false;
+		return false;
+	} catch (e) {
+		log("isLoggedIn error: " + e);
+		return false;
+	}
+};
+
+source.getLoggedInUser = function () {
+	try {
+		if (!source.isLoggedIn()) return null;
+		if (!state.username) validateSession();
+		return state.username || "Logged In";
+	} catch (e) { return null; }
+};
+
+// Mirrors HV-GJ: return true unconditionally so Grayjay never displays
+// "Login cancelled". isLoggedIn() will resolve the real state on next call.
+source.login = function () {
+	try {
+		loadAuthCookies();
+		state.isAuthenticated = true;
+		try { validateSession(); } catch (e) { /* ignore */ }
+		log("login(): accepted - cookies captured by Grayjay");
+		return true;
+	} catch (e) {
+		log("login error: " + e);
+		return true;
+	}
+};
+
+source.prepareLogin = function () {
+	try {
+		state.isAuthenticated = false;
+		state.username = "";
+		state.userId = "";
+		// Reset cookie string to the public defaults so the next login is fresh.
+		headers["Cookie"] = "platform=pc; accessAgeDisclaimerPH=2";
+		try {
+			if (typeof http.clearCookies === "function") {
+				http.clearCookies("pornhub.com");
+				http.clearCookies("www.pornhub.com");
+			}
+			if (typeof bridge !== "undefined" && bridge && bridge.clearCookies) {
+				bridge.clearCookies("pornhub.com");
+				bridge.clearCookies("www.pornhub.com");
+			}
+		} catch (e) { /* ignore */ }
+		return true;
+	} catch (e) {
+		log("prepareLogin error: " + e);
+		return true;
+	}
+};
+
+source.logout = function () {
+	state.isAuthenticated = false;
+	state.username = "";
+	state.userId = "";
+	headers["Cookie"] = "platform=pc; accessAgeDisclaimerPH=2";
+	try {
+		if (typeof http.clearCookies === "function") {
+			http.clearCookies("pornhub.com");
+			http.clearCookies("www.pornhub.com");
+		}
+		if (typeof bridge !== "undefined" && bridge && bridge.clearCookies) {
+			bridge.clearCookies("pornhub.com");
+			bridge.clearCookies("www.pornhub.com");
+		}
+	} catch (e) { /* ignore */ }
+};
+
+// ====================================================================
+// Playlist search & details
+// ====================================================================
+
+source.isPlaylistUrl = function (url) {
+	if (!url) return false;
+	if (isVirtualPlaylistUrl(url)) return true;
+	return /^https?:\/\/(?:[a-z]{2}\.)?(?:www\.)?pornhub\.com\/playlist\/\d+/.test(url);
+};
+
+source.searchPlaylists = function (query) {
+	return new PornhubPlaylistsPager(query, 1);
+};
+
+function _extractPlaylistIdFromUrl(url) {
+	if (!url) return null;
+	var m = url.match(/\/playlist\/(\d+)/);
+	return m ? m[1] : null;
+}
+
+function _playlistUrlFromId(id) {
+	return URL_BASE + "/playlist/" + id;
+}
+
+function _parsePlaylistListItems(html) {
+	// Parses a search result page or "all playlists" page for playlists. Each
+	// playlist tile carries the data-id attribute and a thumbnail/title link.
+	var dom = domParser.parseFromString(html);
+	var out = [];
+	var nodes = dom.querySelectorAll("li.pcVideoListItem, li.playlistLink, ul.user-playlist li, li.playlistsItem");
+	for (var i = 0; i < nodes.length; i++) {
+		var li = nodes[i];
+		var id = li.getAttribute("data-id") || li.getAttribute("data-playlist-id");
+		var titleA = li.querySelector("a.title, span.title a, a.linkPlaylist, a.playlistTitle");
+		var href = titleA ? titleA.getAttribute("href") : "";
+		if (!id && href) {
+			var mm = href.match(/\/playlist\/(\d+)/);
+			if (mm) id = mm[1];
+		}
+		if (!id) continue;
+		var name = titleA ? titleA.textContent.trim() : "";
+		if (!name) {
+			var alt = li.querySelector("img");
+			name = alt ? (alt.getAttribute("alt") || "") : "";
+		}
+		var img = li.querySelector("img");
+		var thumb = img ? (img.getAttribute("data-thumb_url") || img.getAttribute("data-src") || img.getAttribute("src") || "") : "";
+		var ownerA = li.querySelector(".usernameWrap a, a.usernameLink, a[href*='/users/'], a[href*='/model/'], a[href*='/pornstar/'], a[href*='/channels/']");
+		var ownerName = ownerA ? ownerA.textContent.trim() : "";
+		var ownerUrl = ownerA ? (URL_BASE + ownerA.getAttribute("href")) : "";
+		var countEl = li.querySelector(".videoCount, .videos, .videosNumber");
+		var videoCount = 0;
+		if (countEl) {
+			var n = parseInt((countEl.textContent || "").replace(/[^0-9]/g, ""));
+			if (!isNaN(n)) videoCount = n;
+		}
+		out.push({
+			id: id,
+			name: name || ("Playlist " + id),
+			thumbnail: thumb,
+			ownerName: ownerName,
+			ownerUrl: ownerUrl,
+			videoCount: videoCount
+		});
+	}
+	return out;
+}
+
+function _parsePlaylistVideos(html) {
+	// Same DOM shape as the regular video lists.
+	var dom = domParser.parseFromString(html);
+	var out = [];
+	var lis = dom.querySelectorAll("li.pcVideoListItem");
+	for (var i = 0; i < lis.length; i++) {
+		var li = lis[i];
+		var videoId = li.getAttribute("data-video-id");
+		if (!videoId || isNaN(videoId)) continue;
+		var a = li.querySelector("a.js-linkVideoThumb, a.thumbnailTitle, a[href*='view_video']");
+		if (!a) continue;
+		var videoUrl = a.getAttribute("href");
+		if (!videoUrl) continue;
+		if (!videoUrl.startsWith("http")) videoUrl = URL_BASE + videoUrl;
+		var img = li.querySelector("img");
+		var thumb = img ? (img.getAttribute("data-thumb_url") || img.getAttribute("data-src") || img.getAttribute("src") || "") : "";
+		var title = (img && (img.getAttribute("alt") || img.getAttribute("data-title"))) || a.getAttribute("data-title") || a.getAttribute("title") || "";
+		var dEl = li.querySelector("var.duration, .duration");
+		var dur = dEl ? parseDuration(dEl.textContent.trim()) : 0;
+		var vEl = li.querySelector(".views var, .views");
+		var views = vEl ? parseNumberSuffix(vEl.textContent.trim()) : 0;
+		var authorA = li.querySelector(".usernameWrap a, a[href*='/model/'], a[href*='/pornstar/'], a[href*='/channels/'], a[href*='/users/']");
+		var authorName = authorA ? authorA.textContent.trim() : "";
+		var authorUrl = authorA ? (URL_BASE + authorA.getAttribute("href")) : "";
+		out.push({
+			id: videoId,
+			name: title,
+			thumb: thumb,
+			duration: dur,
+			views: views,
+			videoUrl: videoUrl,
+			authorName: authorName,
+			authorUrl: authorUrl
+		});
+	}
+	// Has next page?
+	var pageNext = dom.querySelector("li.page_next a, a.page_next, .pagination a[rel='next']");
+	var hasNext = false;
+	if (pageNext) {
+		var h = pageNext.getAttribute("href") || "";
+		if (h && h !== "#") hasNext = true;
+	}
+	return { videos: out, hasNext: hasNext };
+}
+
+source.getPlaylist = function (url) {
+	if (isVirtualPlaylistUrl(url)) {
+		return getVirtualPlaylistDetails(url);
+	}
+	var id = _extractPlaylistIdFromUrl(url);
+	if (!id) throw new ScriptException("Invalid playlist URL: " + url);
+
+	var html;
+	try {
+		html = httpGET(URL_BASE + "/playlist/" + id, {});
+	} catch (e) {
+		throw new ScriptException("Playlist fetch failed: " + e);
+	}
+	var dom = domParser.parseFromString(html);
+
+	// Title
+	var titleEl = dom.querySelector("h1.playlistTitle, h1.title, div.playlist-info h1, h1");
+	var name = titleEl ? titleEl.textContent.trim() : ("Playlist " + id);
+
+	// Owner
+	var ownerA = dom.querySelector(".playlistMeta a.usernameLink, .playlistBy a, a[href*='/users/'][class*='username']");
+	var ownerName = ownerA ? ownerA.textContent.trim() : "";
+	var ownerUrl = ownerA ? (URL_BASE + ownerA.getAttribute("href")) : "";
+	var ownerImg = dom.querySelector(".playlistMeta img, .playlist-info img");
+	var ownerAvatar = ownerImg ? (ownerImg.getAttribute("src") || "") : "";
+
+	// Videos in this playlist page.
+	var parsed = _parsePlaylistVideos(html);
+
+	var author = ownerName
+		? new PlatformAuthorLink(new PlatformID(PLATFORM, ownerName, config.id), ownerName, ownerUrl, ownerAvatar)
+		: new PlatformAuthorLink(new PlatformID(PLATFORM, "", config.id), "", "", "");
+
+	var pvids = parsed.videos.map(_videoToPlatformVideo);
+
+	return new PlatformPlaylistDetails({
+		id: new PlatformID(PLATFORM, id, config.id),
+		name: name,
+		thumbnail: (parsed.videos[0] && parsed.videos[0].thumb) || "",
+		author: author,
+		datetime: Math.floor(Date.now() / 1000),
+		url: url,
+		videoCount: pvids.length,
+		contents: new VideoPager(pvids, false)
+	});
+};
+
+function _videoToPlatformVideo(v) {
+	return new PlatformVideo({
+		id: new PlatformID(PLATFORM, v.id, config.id),
+		name: v.name || "",
+		thumbnails: new Thumbnails([new Thumbnail(v.thumb || "", 0)]),
+		author: new PlatformAuthorLink(new PlatformID(PLATFORM, v.authorName || "", config.id),
+			v.authorName || "",
+			v.authorUrl || "",
+			""),
+		datetime: v.datetime || undefined,
+		duration: v.duration || 0,
+		viewCount: v.views || 0,
+		url: v.videoUrl,
+		isLive: false
+	});
+}
+
+class PornhubPlaylistsPager extends PlaylistPager {
+	constructor(query, page) {
+		super([], true);
+		this.query = query;
+		this.page = page || 1;
+		this._load();
+	}
+	_load() {
+		try {
+			var url = URL_BASE + "/playlist/search" + buildQuery({ search: this.query, page: this.page });
+			var html = httpGET(url, {});
+			var items = _parsePlaylistListItems(html);
+			var out = items.map(p => new PlatformPlaylist({
+				id: new PlatformID(PLATFORM, p.id, config.id),
+				name: p.name,
+				thumbnail: p.thumbnail || "",
+				author: p.ownerName
+					? new PlatformAuthorLink(new PlatformID(PLATFORM, p.ownerName, config.id), p.ownerName, p.ownerUrl, "")
+					: new PlatformAuthorLink(new PlatformID(PLATFORM, "", config.id), "", "", ""),
+				datetime: Math.floor(Date.now() / 1000),
+				url: _playlistUrlFromId(p.id),
+				videoCount: p.videoCount || 0
+			}));
+			this.results = out;
+			// Detect more pages.
+			var dom = domParser.parseFromString(html);
+			var pageNext = dom.querySelector("li.page_next a, a.page_next, .pagination a[rel='next']");
+			this.hasMore = !!(pageNext && pageNext.getAttribute("href") && pageNext.getAttribute("href") !== "#");
+			if (!this.hasMore && out.length >= 20) this.hasMore = true;
+		} catch (e) {
+			log("PornhubPlaylistsPager._load error: " + e);
+			this.results = [];
+			this.hasMore = false;
+		}
+	}
+	nextPage() {
+		this.page++;
+		this._load();
+		return this;
+	}
+}
+
+// ====================================================================
+// Virtual playlists (Favorites, Watch Later) -- session scoped
+// ====================================================================
+
+const VPL_FAVORITES   = URL_BASE + "/__pornhub__/favorites";
+const VPL_WATCH_LATER = URL_BASE + "/__pornhub__/watch-later";
+
+function isVirtualPlaylistUrl(url) {
+	return url === VPL_FAVORITES || url === VPL_WATCH_LATER;
+}
+
+function _fetchVirtualPlaylistVideos(kind) {
+	// kind: "favorites" | "watch-later"
+	// Pornhub exposes per-user lists at:
+	//   Favorites:   /users/<username>/videos/favourites?page=N
+	//                (alternate alias: /my/favorites/videos)
+	//   Watch Later: /playlist/watch-later (a special server-side playlist)
+	if (!state.username) validateSession();
+	var basePath;
+	if (kind === "favorites") {
+		basePath = state.username
+			? ("/users/" + encodeURIComponent(state.username) + "/videos/favourites")
+			: "/my/favorites/videos";
+	} else {
+		basePath = state.username
+			? ("/users/" + encodeURIComponent(state.username) + "/videos/watch-later")
+			: "/playlist/watch-later";
+	}
+	var out = [];
+	for (var page = 1; page <= 50; page++) {
+		var url = URL_BASE + basePath + buildQuery({ page: page });
+		var html;
+		try { html = httpGET(url, {}); } catch (e) { log("virtualPL " + kind + " p" + page + " err: " + e); break; }
+		var parsed = _parsePlaylistVideos(html);
+		if (!parsed.videos.length) break;
+		for (var i = 0; i < parsed.videos.length; i++) out.push(parsed.videos[i]);
+		if (!parsed.hasNext) break;
+	}
+	return out;
+}
+
+function getVirtualPlaylistDetails(url) {
+	if (!source.isLoggedIn()) throw new ScriptException("Login required for " + url);
+	var kind = (url === VPL_FAVORITES) ? "favorites" : "watch-later";
+	var videos = _fetchVirtualPlaylistVideos(kind);
+	var name = (kind === "favorites") ? "Favorites" : "Watch Later";
+	var author = state.username
+		? new PlatformAuthorLink(new PlatformID(PLATFORM, state.username, config.id),
+			state.username, URL_BASE + "/users/" + encodeURIComponent(state.username), "")
+		: new PlatformAuthorLink(new PlatformID(PLATFORM, "", config.id), "", "", "");
+	var pvids = videos.map(_videoToPlatformVideo);
+	return new PlatformPlaylistDetails({
+		id: new PlatformID(PLATFORM, kind, config.id),
+		name: name,
+		thumbnail: (videos[0] && videos[0].thumb) || "",
+		author: author,
+		datetime: Math.floor(Date.now() / 1000),
+		url: url,
+		videoCount: pvids.length,
+		contents: new VideoPager(pvids, false)
+	});
+}
+
+// ====================================================================
+// Subscription & playlist migration
+// ====================================================================
+
+source.getUserSubscriptions = function () {
+	try {
+		if (!source.isLoggedIn()) {
+			log("getUserSubscriptions: not logged in");
+			return [];
+		}
+		if (!state.username) validateSession();
+		var seen = {};
+		var out = [];
+		// Pornhub paginates subscriptions at /users/<name>/subscriptions?page=N
+		var paths = state.username
+			? [
+				"/users/" + encodeURIComponent(state.username) + "/subscriptions",
+				"/my/subscriptions"
+			]
+			: ["/my/subscriptions"];
+		for (var pi = 0; pi < paths.length && out.length === 0; pi++) {
+			var basePath = paths[pi];
+			for (var page = 1; page <= 50; page++) {
+				var url = URL_BASE + basePath + buildQuery({ page: page });
+				var html;
+				try { html = httpGET(url, {}); } catch (e) { log("getUserSubscriptions " + basePath + " p" + page + ": " + e); break; }
+				var dom = domParser.parseFromString(html);
+				// Match channel/model/pornstar links inside subscription tiles.
+				var anchors = dom.querySelectorAll("a[href^='/model/'], a[href^='/pornstar/'], a[href^='/channels/']");
+				var pageFound = 0;
+				for (var i = 0; i < anchors.length; i++) {
+					var href = anchors[i].getAttribute("href") || "";
+					// Only consume the canonical profile root, not sub-pages.
+					var m = href.match(/^\/(model|pornstar|channels)\/([^\/\?#]+)\/?$/);
+					if (!m) continue;
+					var key = m[1] + "/" + m[2];
+					if (seen[key]) continue;
+					seen[key] = true;
+					out.push(URL_BASE + "/" + key);
+					pageFound++;
+				}
+				if (pageFound === 0) break;
+				var pageNext = dom.querySelector("li.page_next a, a.page_next");
+				if (!pageNext) break;
+				var h = pageNext.getAttribute("href") || "";
+				if (!h || h === "#") break;
+			}
+		}
+		log("getUserSubscriptions: returning " + out.length + " channel(s)");
+		return out;
+	} catch (e) {
+		log("getUserSubscriptions error: " + e);
+		return [];
+	}
+};
+
+source.getUserPlaylists = function () {
+	try {
+		if (!source.isLoggedIn()) {
+			log("getUserPlaylists: not logged in");
+			return [];
+		}
+		if (!state.username) validateSession();
+		var seen = {};
+		var out = [];
+		// User-owned playlists at /users/<name>/playlists?page=N
+		var paths = state.username
+			? [
+				"/users/" + encodeURIComponent(state.username) + "/playlists",
+				"/my/playlists"
+			]
+			: ["/my/playlists"];
+		for (var pi = 0; pi < paths.length && out.length === 0; pi++) {
+			var basePath = paths[pi];
+			for (var page = 1; page <= 20; page++) {
+				var url = URL_BASE + basePath + buildQuery({ page: page });
+				var html;
+				try { html = httpGET(url, {}); } catch (e) { log("getUserPlaylists " + basePath + " p" + page + ": " + e); break; }
+				var items = _parsePlaylistListItems(html);
+				if (!items.length) {
+					// Also try harvesting via direct anchor scan, in case the DOM
+					// shape on /users/<name>/playlists is different.
+					var dom2 = domParser.parseFromString(html);
+					var as = dom2.querySelectorAll("a[href*='/playlist/']");
+					for (var j = 0; j < as.length; j++) {
+						var href = as[j].getAttribute("href") || "";
+						var mm = href.match(/\/playlist\/(\d+)/);
+						if (!mm) continue;
+						if (seen[mm[1]]) continue;
+						seen[mm[1]] = true;
+						out.push(_playlistUrlFromId(mm[1]));
+					}
+					if (out.length === 0) break;
+					continue;
+				}
+				var added = 0;
+				for (var i = 0; i < items.length; i++) {
+					var p = items[i];
+					if (!p.id || seen[p.id]) continue;
+					seen[p.id] = true;
+					out.push(_playlistUrlFromId(p.id));
+					added++;
+				}
+				if (!added) break;
+			}
+		}
+		// Append virtual lists (always available when logged in).
+		out.push(VPL_FAVORITES);
+		out.push(VPL_WATCH_LATER);
+		log("getUserPlaylists: returning " + out.length + " playlist(s) (incl. Favorites + Watch Later)");
+		return out;
+	} catch (e) {
+		log("getUserPlaylists error: " + e);
+		return [];
+	}
+};
+
+// ====================================================================
+// Remote watch history (Pornhub -> Grayjay)
+// ====================================================================
+
+// Build a PlatformVideo for watch-history import. CRITICAL (per Grayjay):
+//   - playbackDate must be > 0 AND must be passed IN the constructor.
+//   - playbackTime must be > 0 AND must be passed IN the constructor, else
+//     Grayjay silently drops the entry from sync.
+function _createHistoryPlatformVideo(v, watchedSecondsOrder) {
+	var playbackDate = (watchedSecondsOrder && watchedSecondsOrder.watchedAt > 0)
+		? watchedSecondsOrder.watchedAt
+		: Math.floor(Date.now() / 1000) - (watchedSecondsOrder ? watchedSecondsOrder.order * 60 : 0);
+	var playbackTime = Math.max(60, Math.floor((v.duration || 300) * 0.5));
+	return new PlatformVideo({
+		id: new PlatformID(PLATFORM, v.id, config.id),
+		name: v.name || "",
+		thumbnails: new Thumbnails([new Thumbnail(v.thumb || "", 0)]),
+		author: new PlatformAuthorLink(new PlatformID(PLATFORM, v.authorName || "", config.id),
+			v.authorName || "",
+			v.authorUrl || "",
+			""),
+		datetime: v.datetime || playbackDate,
+		duration: v.duration || 0,
+		viewCount: v.views || 0,
+		url: v.videoUrl,
+		isLive: false,
+		playbackDate: playbackDate,
+		playbackTime: playbackTime
+	});
+}
+
+// Grayjay detects "Sync Remote History" support by the presence of
+// source.getUserHistory. When enabled, this is called on startup.
+source.getUserHistory = function () {
+	return source.syncRemoteWatchHistory(null);
+};
+
+source.syncRemoteWatchHistory = function (continuationToken) {
+	try {
+		log("===== syncRemoteWatchHistory START =====");
+		if (!source.isLoggedIn()) {
+			log("syncRemoteWatchHistory: not logged in, skipping");
+			return new VideoPager([], false, { token: null });
+		}
+		if (!state.username) validateSession();
+
+		// Pornhub keeps "Recently watched" / "Watch history" at:
+		//   /my/recently-watched           (modern)
+		//   /users/<name>/videos/recent    (alternate / older URL)
+		var historyPaths = state.username
+			? [
+				"/users/" + encodeURIComponent(state.username) + "/videos/recent",
+				"/my/recently-watched"
+			]
+			: ["/my/recently-watched"];
+		var allItems = [];
+		for (var pi = 0; pi < historyPaths.length && allItems.length === 0; pi++) {
+			var basePath = historyPaths[pi];
+			for (var page = 1; page <= 50; page++) {
+				var url = URL_BASE + basePath + buildQuery({ page: page });
+				var html;
+				try { html = httpGET(url, {}); } catch (e) {
+					log("syncRemoteWatchHistory " + basePath + " p" + page + ": " + e);
+					break;
+				}
+				var parsed = _parsePlaylistVideos(html);
+				if (!parsed.videos.length) break;
+				for (var i = 0; i < parsed.videos.length; i++) allItems.push(parsed.videos[i]);
+				if (!parsed.hasNext) break;
+			}
+		}
+		if (!allItems.length) {
+			log("syncRemoteWatchHistory: no history found");
+			return new VideoPager([], false, { token: null });
+		}
+		var out = [];
+		for (var k = 0; k < allItems.length; k++) {
+			out.push(_createHistoryPlatformVideo(allItems[k], { watchedAt: 0, order: k }));
+		}
+		log("syncRemoteWatchHistory: returning " + out.length + " items");
+		log("===== syncRemoteWatchHistory END =====");
+		return new VideoPager(out, false, { token: null });
+	} catch (e) {
+		log("syncRemoteWatchHistory error: " + e);
+		return new VideoPager([], false, { token: null });
+	}
+};
 
 log("LOADED");
