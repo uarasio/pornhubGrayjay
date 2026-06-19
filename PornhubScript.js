@@ -1,1547 +1,3386 @@
-// PMVHaven plugin for Grayjay
-// Provides: video listing, search, channels/profiles, recommendations, comments,
-// playlist search/details, login, history sync, subscription/playlist migration.
+const URL_BASE = "https://www.pornhub.com";
 
-const PLATFORM = "PMVHaven";
-const BASE_URL = "https://pmvhaven.com";
 const PLATFORM_CLAIMTYPE = 3;
 
-const API_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9"
-};
+const PLATFORM = "PornHub";
 
 var config = {};
-var pluginSettings = {
-    // Default ON so Grayjay shows its built-in "Sync" tab and the
-    // "Sync Remote History from this platform on startup" toggle as soon
-    // as the user logs in. Mirrors SB-GJ exactly.
-    syncRemoteHistory: true
-};
 var state = {
-    isAuthenticated: false,
-    username: "",
-    userId: "",
-    authCookies: ""
+	token: "",
+	sessionCookie: "",
+	// Auth state populated by the login flow / isLoggedIn().
+	isAuthenticated: false,
+	username: "",
+	userId: "",
+	// URL-safe profile path like "9fa60b0" used in /users/<X>/... paths.
+	// Different from `username` (which is the display name from <meta USR>).
+	userPath: ""
+};
+var pluginSettings = {
+	syncRemoteHistory: true
 };
 
-// ---------- helpers ----------
+// headers (including cookie by default, since it's used for each session later)
+var headers = {
+	"Cookie": "platform=pc; accessAgeDisclaimerPH=2",
+	"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:143.0) Gecko/20100101 Firefox/143.0",
+	"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+	"Accept-Language": "en-US,en;q=0.5",
+	"Cache-Control": "no-cache",
+	"Upgrade-Insecure-Requests": "1"
+};
 
-function jsonGET(url) {
-    const res = http.GET(url, API_HEADERS, false);
-    if (!res.isOk) {
-        throw new ScriptException("Request failed " + res.code + " for " + url);
-    }
-    try { return JSON.parse(res.body); }
-    catch (e) { throw new ScriptException("Invalid JSON from " + url); }
-}
+// Auth cookies that indicate a successfully logged-in pornhub session. `il`
+// is set as part of the persistent login token, `phn` is the persistent
+// username hash. Presence of either is treated as logged-in; the session is
+// re-verified against /front_page to fetch the actual username.
+const AUTH_COOKIE_NAMES = ["il", "phn"];
 
-function jsonGETNoThrow(url, useAuth) {
-    try {
-        const res = http.GET(url, API_HEADERS, useAuth === true);
-        if (!res.isOk) return null;
-        return JSON.parse(res.body);
-    } catch (e) {
-        log("jsonGETNoThrow failed for " + url + ": " + e);
-        return null;
-    }
-}
-
-function jsonRequest(method, url, body, useAuth) {
-    try {
-        const headers = Object.assign({ "Content-Type": "application/json" }, API_HEADERS);
-        const payload = body ? JSON.stringify(body) : "";
-        let res;
-        if (method === "POST")      res = http.POST(url, payload, headers, useAuth === true);
-        else if (method === "PUT")  res = (http.PUT ? http.PUT(url, payload, headers, useAuth === true)
-                                                    : http.request("PUT", url, payload, headers, useAuth === true));
-        else if (method === "DELETE") res = (http.DELETE ? http.DELETE(url, headers, useAuth === true)
-                                                          : http.request("DELETE", url, "", headers, useAuth === true));
-        else                        res = http.POST(url, payload, headers, useAuth === true);
-        if (!res || !res.isOk) return null;
-        if (!res.body) return { success: true };
-        try { return JSON.parse(res.body); } catch (e) { return { success: true, raw: res.body }; }
-    } catch (e) {
-        log("jsonRequest " + method + " " + url + " failed: " + e);
-        return null;
-    }
-}
-
+/**
+ * Build a query
+ * @param {{[key: string]: any}} params Query params
+ * @returns {String} Query string
+ */
 function buildQuery(params) {
-    const parts = [];
-    for (const k in params) {
-        if (params[k] === undefined || params[k] === null) continue;
-        parts.push(encodeURIComponent(k) + "=" + encodeURIComponent(params[k]));
-    }
-    return parts.length ? "?" + parts.join("&") : "";
+	let query = "";
+	let first = true;
+	for (const [key, value] of Object.entries(params)) {
+		if (value) {
+			if (first) {
+				first = false;
+			} else {
+				query += "&";
+			}
+
+			query += `${key}=${value}`;
+		}
+	}
+
+	return (query && query.length > 0) ? `?${query}` : ""; 
 }
 
-function parseDuration(duration) {
-    if (typeof duration === "number") return duration;
-    if (typeof duration === "string") {
-        const parts = duration.split(":").map(a => parseInt(a, 10));
-        if (parts.length === 2) return parts[0] * 60 + parts[1];
-        if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
-    }
-    return 0;
-}
 
-function parseDateSeconds(iso) {
-    if (!iso) return 0;
-    try {
-        const t = Date.parse(iso);
-        if (!isFinite(t)) return 0;
-        return Math.floor(t / 1000);
-    } catch (e) { return 0; }
-}
+//Source Methods
+source.enable = function (conf, settings, savedStateStr) {
+	config = conf ?? {};
 
-function slugifyTitle(title) {
-    return (title || "")
-        .replace(/[^a-zA-Z0-9]+/g, "-")
-        .replace(/^-+|-+$/g, "");
-}
+	if (settings && typeof settings.syncRemoteHistory !== "undefined") {
+		const v = settings.syncRemoteHistory;
+		pluginSettings.syncRemoteHistory = (v === true) || (typeof v === "string" && v.toLowerCase() === "true");
+	}
 
-function videoUrlFromIdTitle(id, title) {
-    const slug = slugifyTitle(title);
-    return BASE_URL + "/video/" + (slug ? slug + "_" : "") + id;
-}
+	if (savedStateStr) {
+		try {
+			const s = JSON.parse(savedStateStr);
+			state.token = s.token || "";
+			state.sessionCookie = s.sessionCookie || "";
+			state.isAuthenticated = !!s.isAuthenticated;
+			state.username = s.username || "";
+			state.userId = s.userId || "";
+			state.userPath = s.userPath || "";
+			log("State loaded: token=" + (state.token ? "present" : "empty") + " auth=" + state.isAuthenticated + " userPath=" + state.userPath);
+		} catch (e) {
+			log("Failed to parse saved state: " + e);
+		}
+	}
 
-function channelUrlFromUsername(username) {
-    return BASE_URL + "/profile/" + username;
-}
-
-function playlistUrlFromId(id) {
-    return BASE_URL + "/playlists/" + id;
-}
-
-function extractVideoIdFromUrl(url) {
-    if (!url) return null;
-    // matches /video/<slug>_<id> or /video/<id>
-    const m = url.match(/\/video\/(?:[^_\/?#]+_)?([a-f0-9]{24})/i);
-    if (m) return m[1];
-    // standalone id
-    const m2 = url.match(/([a-f0-9]{24})/i);
-    return m2 ? m2[1] : null;
-}
-
-function extractUsernameFromProfileUrl(url) {
-    const m = url.match(/\/profile\/([^\/\?#]+)/);
-    return m ? decodeURIComponent(m[1]) : null;
-}
-
-function extractPlaylistIdFromUrl(url) {
-    const m = url.match(/\/playlists?\/([a-f0-9]{24})/i);
-    return m ? m[1] : null;
-}
-
-function isObjectId(s) {
-    return typeof s === "string" && /^[a-f0-9]{24}$/i.test(s);
-}
-
-// Resolve a profile token (which may be a username OR a 24-char user id, since
-// pmvhaven.com profile URLs use the user's _id) into the full user document.
-function fetchUserByToken(token) {
-    if (!token) return null;
-    if (isObjectId(token)) {
-        const byId = jsonGETNoThrow(BASE_URL + "/api/users/" + token);
-        if (byId && byId.data) return byId.data;
-    }
-    const byName = jsonGETNoThrow(BASE_URL + "/api/users/by-username/" + encodeURIComponent(token));
-    if (byName && byName.data) return byName.data;
-    return null;
-}
-
-// ---------- builders ----------
-
-function createAuthor(uploaderName, uploaderUsername, uploaderAvatarUrl) {
-    const name = uploaderUsername || uploaderName || "";
-    if (!name) {
-        return new PlatformAuthorLink(
-            new PlatformID(PLATFORM, "", config.id),
-            "", "", ""
-        );
-    }
-    return new PlatformAuthorLink(
-        new PlatformID(PLATFORM, name, config.id),
-        name,
-        channelUrlFromUsername(name),
-        uploaderAvatarUrl || ""
-    );
-}
-
-function toPlatformVideo(v) {
-    const id = v._id || v.id || "";
-    const vidurl = videoUrlFromIdTitle(id, v.title || "");
-    const thumbUrl = v.thumbnailUrl || (v.thumbnailSizes && (v.thumbnailSizes.lg || v.thumbnailSizes.md)) || "";
-    const durationSec = (typeof v.durationSeconds === "number" && v.durationSeconds > 0)
-        ? v.durationSeconds
-        : parseDuration(v.duration);
-
-    const pv = new PlatformVideo({
-        id: new PlatformID(PLATFORM, id, config.id),
-        name: v.title || "Untitled",
-        thumbnails: thumbUrl ? new Thumbnails([new Thumbnail(thumbUrl, 720)]) : new Thumbnails([]),
-        author: createAuthor(v.uploader, v.uploaderUsername, v.uploaderAvatarUrl),
-        datetime: parseDateSeconds(v.uploadDate || v.createdAt),
-        duration: durationSec,
-        viewCount: v.views || 0,
-        url: vidurl,
-        isLive: false
-    });
-    // Resume-point hydration when the server has returned the logged-in user's
-    // watch progress on the video document.
-    if (typeof v.watchProgress === "number" && v.watchProgress > 0) {
-        try { pv.playbackTime = Math.floor(v.watchProgress); } catch (e) { /* ignore */ }
-    }
-    if (v.lastWatchedAt) {
-        try { pv.playbackDate = parseDateSeconds(v.lastWatchedAt); } catch (e) { /* ignore */ }
-    }
-    return pv;
-}
-
-// Build a PlatformVideo for watch-history import. CRITICAL: Grayjay only imports
-// history items whose `playbackDate` is non-null AND `playbackTime > 0`, and it
-// ONLY reads these when they are passed INTO the PlatformVideo constructor — values
-// assigned after construction (pv.playbackTime = ...) are ignored. See
-// StateHistory.syncRemoteHistory (grayjay-android): `if(video.playbackTime > 0)`.
-function createHistoryPlatformVideo(v, watchedSeconds, fallbackOrder) {
-    const id = v._id || v.id || "";
-    const vidurl = videoUrlFromIdTitle(id, v.title || "");
-    const thumbUrl = v.thumbnailUrl || (v.thumbnailSizes && (v.thumbnailSizes.lg || v.thumbnailSizes.md)) || "";
-    const durationSec = (typeof v.durationSeconds === "number" && v.durationSeconds > 0)
-        ? v.durationSeconds
-        : parseDuration(v.duration);
-
-    // playbackDate = when it was watched (unix seconds). Must be > 0.
-    let playbackDate = watchedSeconds && watchedSeconds > 0 ? watchedSeconds : 0;
-    if (!playbackDate) {
-        // Preserve descending order even without a server timestamp.
-        playbackDate = Math.floor(Date.now() / 1000) - (fallbackOrder || 0) * 60;
-    }
-
-    // playbackTime = resume position (seconds). MUST be > 0 or Grayjay drops it.
-    let playbackTime;
-    if (typeof v.watchProgress === "number" && v.watchProgress > 0) {
-        playbackTime = Math.floor(v.watchProgress);
-    } else {
-        // Completed/unknown items: use half the duration (>=60s) so they still import.
-        playbackTime = Math.max(60, Math.floor((durationSec || 300) * 0.5));
-    }
-
-    return new PlatformVideo({
-        id: new PlatformID(PLATFORM, id, config.id),
-        name: v.title || "Untitled",
-        thumbnails: thumbUrl ? new Thumbnails([new Thumbnail(thumbUrl, 720)]) : new Thumbnails([]),
-        author: createAuthor(v.uploader, v.uploaderUsername, v.uploaderAvatarUrl),
-        datetime: parseDateSeconds(v.uploadDate || v.createdAt) || playbackDate,
-        duration: durationSec,
-        viewCount: v.views || 0,
-        url: vidurl,
-        isLive: false,
-        // MUST be in the constructor for Grayjay to import the history item.
-        playbackDate: playbackDate,
-        playbackTime: playbackTime
-    });
-}
-
-function toPlatformChannel(user, subscriberCount) {
-    const username = user.username || "";
-    return new PlatformChannel({
-        id: new PlatformID(PLATFORM, username, config.id, PLATFORM_CLAIMTYPE),
-        name: username,
-        thumbnail: user.avatarUrl || "",
-        banner: user.bannerUrl || "",
-        subscribers: subscriberCount || 0,
-        description: user.bio || "",
-        url: channelUrlFromUsername(username),
-        urlAlternatives: [channelUrlFromUsername(username)],
-        links: user.socialLinks ? cleanSocialLinks(user.socialLinks) : {}
-    });
-}
-
-function cleanSocialLinks(links) {
-    const out = {};
-    const map = { website: "Website", twitter: "Twitter", discord: "Discord", telegram: "Telegram" };
-    for (const k in map) {
-        const v = links[k];
-        if (v && typeof v === "string" && v.length > 0) out[map[k]] = v;
-    }
-    return out;
-}
-
-function toPlatformPlaylist(p) {
-    const ownerName = p.ownerUsername || p.owner || "";
-    const author = ownerName
-        ? new PlatformAuthorLink(
-            new PlatformID(PLATFORM, ownerName, config.id),
-            ownerName,
-            channelUrlFromUsername(ownerName),
-            p.ownerAvatarUrl || ""
-          )
-        : new PlatformAuthorLink(new PlatformID(PLATFORM, "", config.id), "", "", "");
-    const count = (typeof p.validVideoCount === "number") ? p.validVideoCount
-        : (typeof p.videoCount === "number") ? p.videoCount
-        : (Array.isArray(p.videos) ? p.videos.length : 0);
-    return new PlatformPlaylist({
-        id: new PlatformID(PLATFORM, p._id, config.id),
-        name: p.name || "Playlist",
-        thumbnail: p.thumbnailUrl || p.thumbnail || "",
-        author: author,
-        datetime: parseDateSeconds(p.createdAt),
-        url: playlistUrlFromId(p._id),
-        videoCount: count
-    });
-}
-
-// ---------- source plugin ----------
-
-source.enable = function(conf, settings, savedState) {
-    config = conf || {};
-    if (settings && typeof settings.syncRemoteHistory !== "undefined") {
-        const v = settings.syncRemoteHistory;
-        pluginSettings.syncRemoteHistory = (v === true) || (typeof v === "string" && v.toLowerCase() === "true");
-    }
-    if (savedState) {
-        try {
-            const s = JSON.parse(savedState);
-            state.username = s.username || "";
-            state.userId = s.userId || "";
-            state.isAuthenticated = !!s.isAuthenticated;
-        } catch (e) { /* ignore */ }
-    }
-    // If Grayjay tells us the user is logged in (via its built-in bridge), trust it.
-    try {
-        if (typeof bridge !== "undefined" && bridge && typeof bridge.isLoggedIn === "function" && bridge.isLoggedIn()) {
-            state.isAuthenticated = true;
-        }
-    } catch (e) { /* ignore */ }
-    log("PMVHaven plugin enabled. syncRemoteHistory=" + pluginSettings.syncRemoteHistory +
-        " auth=" + state.isAuthenticated);
+	// If Grayjay tells us the user is logged in (via its built-in bridge), trust it.
+	try {
+		if (typeof bridge !== "undefined" && bridge && typeof bridge.isLoggedIn === "function" && bridge.isLoggedIn()) {
+			state.isAuthenticated = true;
+		}
+	} catch (e) { /* ignore */ }
 };
 
-source.disable = function() {
-    state.isAuthenticated = false;
-    state.username = "";
-    state.userId = "";
+source.disable = function () {
+	state.isAuthenticated = false;
+	state.username = "";
+	state.userId = "";
+	state.userPath = "";
 };
 
-source.setSettings = function(newsettings) {
-    if (!newsettings) return;
-    if (typeof newsettings.syncRemoteHistory !== "undefined") {
-        const v = newsettings.syncRemoteHistory;
-        pluginSettings.syncRemoteHistory = (v === true) || (typeof v === "string" && v.toLowerCase() === "true");
-    }
+source.setSettings = function (newsettings) {
+	if (!newsettings) return;
+	if (typeof newsettings.syncRemoteHistory !== "undefined") {
+		const v = newsettings.syncRemoteHistory;
+		pluginSettings.syncRemoteHistory = (v === true) || (typeof v === "string" && v.toLowerCase() === "true");
+	}
 };
 
 source.saveState = function() {
-    return JSON.stringify({
-        isAuthenticated: state.isAuthenticated,
-        username: state.username,
-        userId: state.userId
-    });
+	return JSON.stringify({
+		token: state.token,
+		sessionCookie: state.sessionCookie,
+		isAuthenticated: state.isAuthenticated,
+		username: state.username,
+		userId: state.userId,
+		userPath: state.userPath
+	});
 };
 
-source.getCapabilities = function() {
-    // Kept for completeness, but note: Grayjay does NOT read this to decide
-    // whether to show the Sync tab. It detects history support purely by the
-    // presence of `source.getUserHistory` (JSClient.kt: `!!source.getUserHistory`).
-    // The actual gate is therefore `source.getUserHistory` being defined below.
-    return {
-        hasSyncRemoteWatchHistory: pluginSettings.syncRemoteHistory
-    };
+source.getCapabilities = function () {
+	// Kept for completeness; Grayjay detects history sync support purely by
+	// the presence of source.getUserHistory below.
+	return {
+		hasSyncRemoteWatchHistory: pluginSettings.syncRemoteHistory
+	};
 };
 
-// ---------- auth ----------
+source.getHome = function () {
+	return getVideoPager('/video', {}, 1);
+};
 
-// All possible better-auth session cookie names PMVHaven may set. Production
-// (HTTPS) uses the "__Secure-" prefixed variants; large tokens get chunked
-// into ".0", ".1", ... We treat any of these as a valid session marker.
-const AUTH_COOKIE_NAMES = [
-    "__Secure-better-auth.session_token",
-    "better-auth.session_token"
+
+
+source.searchSuggestions = function(query) {
+	if(query.length < 1) return [];
+
+	try {
+		// Build autocomplete API URL
+		var apiUrl = URL_BASE + "/api/v1/video/search_autocomplete?pornstars=true&token=" + state.token + "&orientation=straight&q=" + encodeURIComponent(query) + "&alt=0";
+		log("Fetching autocomplete: " + apiUrl);
+
+		// Use httpGET with options object
+		var json = httpGET(apiUrl, {
+			headers: {
+				"Cookie": headers["Cookie"],
+				"User-Agent": headers["User-Agent"],
+				"Accept": "*/*",
+				"Accept-Language": "en-US,en;q=0.5",
+				"Referer": URL_BASE + "/",
+				"X-Requested-With": "XMLHttpRequest",
+				"Content-Type": "application/x-www-form-urlencoded"
+			},
+			requireToken: true,
+			parseJson: true,
+			retries: 3
+		});
+
+		if (!json || json.length === 0) {
+			log("Empty autocomplete JSON");
+			return [];
+		}
+
+		var suggestions = [];
+
+		// Add query suggestions
+		if (json.queries && Array.isArray(json.queries)) {
+			suggestions = suggestions.concat(json.queries);
+		}
+
+		// Add model names (prefixed with @)
+		if (json.models && Array.isArray(json.models)) {
+			json.models.forEach(function(model) {
+				suggestions.push("@" + model.name);
+			});
+		}
+
+		// Add pornstar names (prefixed with @)
+		if (json.pornstars && Array.isArray(json.pornstars)) {
+			json.pornstars.forEach(function(pornstar) {
+				suggestions.push("@" + pornstar.name);
+			});
+		}
+
+		// Add channel names (prefixed with #)
+		if (json.channels && Array.isArray(json.channels)) {
+			json.channels.forEach(function(channel) {
+				suggestions.push("#" + channel.name);
+			});
+		}
+
+		log("Autocomplete returned " + suggestions.length + " total suggestions");
+		return suggestions;
+	} catch(e) {
+		log("Search suggestions failed: " + e);
+		return [];
+	}
+};
+
+// ---------- search constants ----------
+
+const SORT_OPTIONS = ["Relevance", "Most Recent", "Most Viewed", "Top Rated", "Longest"];
+const SORT_MAP = {
+	"Relevance":    "",
+	"Most Recent":  "mr",
+	"Most Viewed":  "mv",
+	"Top Rated":    "tr",
+	"Longest":      "lg"
+};
+// `period=` filter values used by pornhub's /video/search endpoint.
+const DATE_MAP = {
+	"today":  "t",
+	"week":   "w",
+	"month":  "m",
+	"year":   "y",
+	"all":    "a"
+};
+// Duration filter: `min_duration` / `max_duration` in minutes.
+const DURATION_MAP = {
+	"short":  { min_duration: 0,  max_duration: 10 },
+	"medium": { min_duration: 10, max_duration: 20 },
+	"long":   { min_duration: 20, max_duration: 30 },
+	"vlong":  { min_duration: 30 }
+};
+// Production filter -> `p=` query parameter
+const PRODUCTION_MAP = {
+	"professional": "professional",
+	"homemade":     "homemade"
+};
+
+// Popular pornhub category IDs (used by `cat=` query parameter on /video/search).
+// Mirrors the way HV-GJ exposes a multi-select "Category" filter.
+const CATEGORY_FILTERS = [
+	{ name: "Any",           value: ""   },
+	{ name: "Amateur",       value: "3"  },
+	{ name: "Anal",          value: "35" },
+	{ name: "Asian",         value: "1"  },
+	{ name: "Babe",          value: "4"  },
+	{ name: "Big Ass",       value: "6"  },
+	{ name: "Big Tits",      value: "7"  },
+	{ name: "Blonde",        value: "9"  },
+	{ name: "Blowjob",       value: "13" },
+	{ name: "Brunette",      value: "10" },
+	{ name: "Cartoon",       value: "57" },
+	{ name: "Cosplay",       value: "115"},
+	{ name: "Creampie",      value: "15" },
+	{ name: "Cumshot",       value: "16" },
+	{ name: "Ebony",         value: "2"  },
+	{ name: "Fetish",        value: "20" },
+	{ name: "Gangbang",      value: "55" },
+	{ name: "Hardcore",      value: "27" },
+	{ name: "Hentai",        value: "60" },
+	{ name: "Interracial",   value: "29" },
+	{ name: "Japanese",      value: "111"},
+	{ name: "Latina",        value: "30" },
+	{ name: "Lesbian",       value: "31" },
+	{ name: "MILF",          value: "33" },
+	{ name: "Pornstar",      value: "37" },
+	{ name: "POV",           value: "41" },
+	{ name: "Public",        value: "42" },
+	{ name: "Reality",       value: "5"  },
+	{ name: "Red Head",      value: "21" },
+	{ name: "Rough Sex",     value: "94" },
+	{ name: "Squirt",        value: "67" },
+	{ name: "Teen (18+)",    value: "14" },
+	{ name: "Threesome",     value: "53" },
+	{ name: "Toys",          value: "23" },
+	{ name: "Verified Amateurs", value: "139" },
+	{ name: "Vintage",       value: "61" },
+	{ name: "Webcam",        value: "26" }
 ];
 
-function hasValidAuthCookie(cookies) {
-    if (!cookies) return false;
-    // string form: "name=value; name2=value2"
-    if (typeof cookies === "string") {
-        if (cookies.length === 0) return false;
-        for (let i = 0; i < AUTH_COOKIE_NAMES.length; i++) {
-            const n = AUTH_COOKIE_NAMES[i];
-            if (cookies.indexOf(n + "=") >= 0 || cookies.indexOf(n + ".0=") >= 0) return true;
-        }
-        return false;
+source.getSearchCapabilities = () => {
+	return {
+		// Only video feed types here so Grayjay shows the filter/sort UI on the
+		// Videos tab. Channels/Playlists searches happen via dedicated entry
+		// points (searchChannels / searchPlaylists).
+		types: [Type.Feed.Mixed, Type.Feed.Videos],
+		sorts: SORT_OPTIONS,
+		filters: [
+			{
+				id: "date",
+				name: "Date",
+				isMultiSelect: false,
+				filters: [
+					{ name: "Any time",     value: ""      },
+					{ name: "Today",        value: "today" },
+					{ name: "This week",    value: "week"  },
+					{ name: "This month",   value: "month" },
+					{ name: "This year",    value: "year"  }
+				]
+			},
+			{
+				id: "duration",
+				name: "Duration",
+				isMultiSelect: false,
+				filters: [
+					{ name: "Any",          value: ""        },
+					{ name: "0-10 min",     value: "short"   },
+					{ name: "10-20 min",    value: "medium"  },
+					{ name: "20-30 min",    value: "long"    },
+					{ name: "30+ min",      value: "vlong"   }
+				]
+			},
+			{
+				id: "quality",
+				name: "Quality",
+				isMultiSelect: false,
+				filters: [
+					{ name: "Any",          value: ""   },
+					{ name: "HD",           value: "hd" }
+				]
+			},
+			{
+				id: "production",
+				name: "Production",
+				isMultiSelect: false,
+				filters: [
+					{ name: "Any",          value: ""             },
+					{ name: "Professional", value: "professional" },
+					{ name: "Homemade",     value: "homemade"     }
+				]
+			},
+			{
+				id: "category",
+				name: "Category",
+				isMultiSelect: false,
+				filters: CATEGORY_FILTERS
+			}
+		]
+	};
+};
+
+function _pickFilter(filters, id) {
+	if (!filters) return null;
+	const v = filters[id];
+	if (Array.isArray(v)) return v.length ? v[0] : null;
+	return v || null;
+}
+
+function buildSearchFilterParams(order, filters) {
+	const out = {};
+	if (order && SORT_MAP[order] !== undefined && SORT_MAP[order] !== "") {
+		out.o = SORT_MAP[order];
+	}
+	if (filters && typeof filters === "object") {
+		const date = _pickFilter(filters, "date");
+		if (date && DATE_MAP[date]) out.period = DATE_MAP[date];
+		const dur = _pickFilter(filters, "duration");
+		if (dur && DURATION_MAP[dur]) Object.assign(out, DURATION_MAP[dur]);
+		const q = _pickFilter(filters, "quality");
+		if (q === "hd") out.hd = 1;
+		const prod = _pickFilter(filters, "production");
+		if (prod && PRODUCTION_MAP[prod]) out.p = PRODUCTION_MAP[prod];
+		const cat = _pickFilter(filters, "category");
+		if (cat) out.cat = cat;
+	}
+	return out;
+}
+
+source.search = function (query, type, order, filters) {
+	// Route by feed type. Channels & Playlists have dedicated entry points.
+	if (type === Type.Feed.Channels) return source.searchChannels(query);
+	if (type === Type.Feed.Playlists) return source.searchPlaylists(query);
+
+	const extra = buildSearchFilterParams(order, filters);
+	const params = Object.assign({ search: query }, extra);
+	return getVideoPager("/video/search", params, 1);
+};
+
+source.getSearchChannelContentsCapabilities = function () {
+	return {
+		types: [Type.Feed.Mixed],
+		sorts: [Type.Order.Chronological],
+		filters: []
+	};
+};
+
+source.searchChannelContents = function (channelUrl, query, type, order, filters) {
+	throw new ScriptException("This is a sample");
+};
+
+source.searchChannels = function (query) {
+	return getAutocompleteChannelPager(query);
+};
+
+
+source.isChannelUrl = function (url) {
+	return url.includes(".pornhub.com/model/") || url.includes(".pornhub.com/channels/") || url.includes(".pornhub.com/pornstar/") || /\.pornhub\.com\/users\/[^\/?#]+\/?$/.test(url);
+};
+
+source.getChannel = function (url) {
+	if (!url.startsWith("htt")) {
+		url = URL_BASE + url;
+	}
+
+	// Normalize the URL to remove country-specific subdomains
+	url = normalizePornhubUrl(url);
+
+	var channelUrlName = url.split("/")[4]
+
+	var info;
+	if(url.includes("/channels/")) {
+		info = getChannelInfo(url);
+	} else {
+		// covers /pornstar/, /model/, /users/
+		info = getPornstarInfo(url);
+	}
+
+    return new PlatformChannel({
+        id: new PlatformID(PLATFORM, channelUrlName, config.id, PLATFORM_CLAIMTYPE),
+        name: info.channelName,
+        thumbnail: info.channelThumbnail,
+        banner: info.channelBanner,
+        subscribers: info.channelSubscribers,
+        description: info.channelDescription,
+        url: info.channelUrl,
+        links: info.channelLinks
+    })
+}
+
+
+
+source.getChannelContents = function (url, type, order, filters) {
+	// Normalize the URL to remove country-specific subdomains
+	url = normalizePornhubUrl(url);
+
+	// channels have different format than model/pornstar
+	if(url.includes("/channels/")) {
+		return getChannelVideosPager(url + "/videos", {}, 1);
+	} else if(url.includes("/model/")){
+		return getModelVideosPager(url + "/videos", {}, 1);
+	} else if(url.includes("/users/")) {
+		// User-account profile videos -- e.g. /users/<name>/videos[?o=mr&page=N]
+		return getModelVideosPager(url.replace(/\/$/, "") + "/videos", {}, 1);
+	} else {
+		return getPornstarVideosPager(url + "/videos/upload", {}, 1);
+	}
+};
+
+
+source.isContentDetailsUrl = function(url) {
+	return url.includes(".pornhub.com/view_video.php?viewkey=") || url.includes("/view_video.php?viewkey=");
+};
+
+const supportedResolutions = {
+	'1080': { width: 1920, height: 1080 },
+	'720': { width: 1280, height: 720 },
+	'480': { width: 854, height: 480 },
+	'360': { width: 640, height: 360 },
+	'240': { width: 352, height: 240 },
+	'144': { width: 256, height: 144 }
+};
+
+
+
+source.getContentDetails = function (url) {
+	var html = httpGET(url, {});
+
+	let flashvarsMatch = html.match(/var\s+flashvars_\d+\s*=\s*({.+?});/);
+
+	let flashvars = {};
+	if (flashvarsMatch) {
+		flashvars = JSON.parse(flashvarsMatch[1]);
+	}
+
+	var mediaDefinitions = flashvars["mediaDefinitions"];
+	var sources = [];
+
+	for (const mediaDefinition of mediaDefinitions) {
+		if (typeof mediaDefinition.defaultQuality !== "boolean") continue;
+		if (typeof mediaDefinition.quality === "object") continue;
+		var resolution = supportedResolutions[mediaDefinition.quality];
+		if (!resolution) continue;
+		sources.push(new HLSSource({
+			name: `${resolution.width}x${resolution.height}`,
+			url: mediaDefinition.videoUrl,
+			duration: flashvars.video_duration ?? 0,
+			priority: true,
+			requestModifier: { headers: { "Referer": URL_BASE + "/" } }
+		}));
+	}
+
+	var dom = domParser.parseFromString(html);
+
+	var ldJson = JSON.parse(dom.querySelector('script[type="application/ld+json"]').text)
+
+	var description = ldJson.description;
+
+	var userAvatar = dom.getElementsByClassName("userAvatar")[0].querySelector("img").getAttribute("src")
+
+	var userInfoNode = dom.getElementsByClassName("userInfo")[0];
+
+	var channelUrlId = userInfoNode.querySelector("div.usernameWrap a").getAttribute("href").split('/').pop();
+
+	var subscribersStr = "0";
+	var infoSpans = userInfoNode.querySelectorAll("span");
+	for (var i = 0; i < infoSpans.length; i++) {
+		var spanText = infoSpans[i].textContent.trim();
+		if (spanText.includes("Subscriber")) {
+			subscribersStr = spanText;
+			break;
+		}
+	}
+	var subscribers = parseStringWithKorMSuffixes(subscribersStr);
+	var displayName = userInfoNode.querySelector("a").text;
+	var channelUrl = URL_BASE + userInfoNode.querySelector("a").getAttribute("href");
+
+
+	var views = parseInt(ldJson.interactionStatistic[0].userInteractionCount.replace(/,/g, ""))
+
+	var videoId = flashvars.playbackTracking.video_id.toString();
+
+	// note: subtitles are in https://www.pornhub.com/video/caption?id={videoId}&language_id=1&caption_type=0 if present
+
+	const details = new PlatformVideoDetails({
+		id: new PlatformID(PLATFORM, videoId, config.id),
+		name: flashvars.video_title,
+		thumbnails: new Thumbnails([new Thumbnail(flashvars.image_url, 0)]),
+		author: new PlatformAuthorLink(new PlatformID(PLATFORM, channelUrlId, config.id),
+			displayName,
+			channelUrl,
+			userAvatar ?? "",
+			subscribers ?? 0),
+		datetime: Math.round((new Date(ldJson.uploadDate)).getTime() / 1000),
+		duration: flashvars.video_duration,
+		viewCount: views,
+		url: flashvars.link_url,
+		isLive: false,
+		description: description,
+		video: new VideoSourceDescriptor(sources),
+		//subtitles: subtitles
+	});
+
+	details.getContentRecommendations = function () {
+		return source.getContentRecommendations(url);
+	};
+
+	return details;
+};
+
+// Get content recommendations based on a video URL
+source.getContentRecommendations = function(url) {
+	var html = httpGET(url, {});
+	var dom = domParser.parseFromString(html);
+
+	// Find all li.pcVideoListItem in the page (these are related videos)
+	var liElements = dom.querySelectorAll("li.pcVideoListItem");
+
+	if (liElements.length === 0) {
+		log("No recommendations found");
+		return new ContentPager([], false);
+	}
+
+	var resultArray = [];
+
+	liElements.forEach(function (li) {
+		const videoId = li.getAttribute("data-video-id");
+		if (videoId && !isNaN(videoId)) {
+			const aElement = li.querySelector('a.thumbnailTitle, a[href*="view_video"]');
+			if (aElement) {
+				const videoUrl = aElement.getAttribute('href');
+				const imgElement = li.querySelector('img');
+				if (imgElement && videoUrl) {
+					const thumbnailUrl = imgElement.getAttribute('src') || imgElement.getAttribute('data-src') || imgElement.getAttribute('data-thumb_url');
+					const title = aElement.getAttribute("title") || aElement.textContent.trim() || imgElement.getAttribute("alt");
+					const durationVar = li.querySelector(".duration, var.duration");
+					const durationStr = durationVar ? durationVar.textContent.trim() : "0:00";
+					const duration = parseDuration(durationStr);
+					const viewsSpan = li.querySelector(".views var, .views");
+					const viewsStr = viewsSpan ? viewsSpan.textContent.trim() : "0";
+					const views = viewsStr && viewsStr.includes("K") || viewsStr.includes("M") ? parseNumberSuffix(viewsStr) : 0;
+
+					const authorLink = li.querySelector(".usernameWrap a, a[href*='/model/'], a[href*='/pornstar/'], a[href*='/channels/']");
+					let authorInfo = {
+						channel: "",
+						authorName: ""
+					};
+					if (authorLink) {
+						authorInfo.channel = URL_BASE + authorLink.getAttribute("href");
+						authorInfo.authorName = authorLink.textContent.trim();
+					}
+
+					resultArray.push(new PlatformVideo({
+						id: new PlatformID(PLATFORM, videoId, config.id),
+						name: title ?? "",
+						thumbnails: new Thumbnails([new Thumbnail(thumbnailUrl, 0)]),
+						author: new PlatformAuthorLink(new PlatformID(PLATFORM, authorInfo.authorName, config.id),
+							authorInfo.authorName,
+							authorInfo.channel,
+							""),
+						datetime: undefined,
+						duration: duration,
+						viewCount: views,
+						url: videoUrl.startsWith("http") ? videoUrl : URL_BASE + videoUrl,
+						isLive: false
+					}));
+				}
+			}
+		}
+	});
+
+	log(`Found ${resultArray.length} recommendations`);
+	return new ContentPager(resultArray, false);
+};
+
+// Get shorts from the /shorties/ page
+source.getShorts = function(context) {
+	// Parse context
+	var from = 1;
+	var count = 12;
+
+	if (typeof context === 'string') {
+		try {
+			const parsed = JSON.parse(context);
+			from = parsed.from ?? 1;
+			count = parsed.count ?? 12;
+		} catch (e) {
+			// Use defaults
+		}
+	} else if (context) {
+		from = context.from ?? 1;
+		count = context.count ?? 12;
+	}
+
+	return getShortsPager(from, count);
+};
+
+function getShortsPager(from, count) {
+	log(`getShortsPager from=${from} count=${count}`);
+
+	// PornHub's /shorties page returns random shorts on each visit
+	// Not paginated - each fetch gets a fresh random set
+	const url = URL_BASE + "/shorties";
+
+	var html = httpGET(url, {});
+
+	// Extract JSON_SHORTIES from the JavaScript in the HTML
+	// Pattern can be either:
+	// 1. JSON_SHORTIES = insertAfterNthPosition([...]);
+	// 2. if (SHOW_SHORTIES_ADS) { JSON_SHORTIES = insertAfterNthPosition([...]); }
+
+	// Find the line that assigns JSON_SHORTIES
+	var startIdx = html.indexOf('JSON_SHORTIES = insertAfterNthPosition([');
+	if (startIdx === -1) {
+		log("No JSON_SHORTIES assignment found in page");
+		return new PornhubVideoPager([], false, "/shorties", {}, 1);
+	}
+
+	// Extract the JSON array - find the matching closing bracket and semicolon
+	var arrayStart = html.indexOf('[', startIdx);
+	var bracketCount = 0;
+	var arrayEnd = -1;
+	var inString = false;
+	var escapeNext = false;
+
+	for (var i = arrayStart; i < html.length; i++) {
+		var char = html[i];
+
+		if (escapeNext) {
+			escapeNext = false;
+			continue;
+		}
+
+		if (char === '\\') {
+			escapeNext = true;
+			continue;
+		}
+
+		if (char === '"' && !escapeNext) {
+			inString = !inString;
+			continue;
+		}
+
+		if (inString) continue;
+
+		if (char === '[') {
+			bracketCount++;
+		} else if (char === ']') {
+			bracketCount--;
+			if (bracketCount === 0) {
+				arrayEnd = i + 1;
+				break;
+			}
+		}
+	}
+
+	if (arrayEnd === -1) {
+		log("Could not find end of JSON_SHORTIES array");
+		return new PornhubVideoPager([], false, "/shorties", {}, 1);
+	}
+
+	var jsonString = html.substring(arrayStart, arrayEnd);
+	if (!jsonString) {
+		log("No JSON_SHORTIES data extracted");
+		return new PornhubVideoPager([], false, "/shorties", {}, 1);
+	}
+
+	var shortsData;
+	try {
+		shortsData = JSON.parse(jsonString);
+	} catch (e) {
+		log("Failed to parse JSON_SHORTIES: " + e);
+		return new PornhubVideoPager([], false, "/shorties", {}, 1);
+	}
+
+	if (!shortsData || shortsData.length === 0) {
+		log("No shorts data found");
+		return new PornhubVideoPager([], false, "/shorties", {}, 1);
+	}
+
+	var resultArray = [];
+
+	shortsData.forEach(function (short) {
+		if (!short.videoId) return;
+
+		const videoId = short.videoId.toString();
+		const title = short.videoTitle || "";
+		const thumbnailUrl = short.imageUrl || "";
+		const videoUrl = short.linkUrl || "";
+		const authorName = short.name || "";
+		const authorUrl = short.profileUrl || "";
+
+		// Calculate duration from mediaDefinitions if available
+		var duration = 0;
+		if (short.trackingTimeWatched && short.trackingTimeWatched.video_duration) {
+			duration = short.trackingTimeWatched.video_duration;
+		}
+
+		// Parse likes as views (shorties don't have view count)
+		var views = 0;
+		if (short.likeInfo) {
+			const likeStr = short.likeInfo.toString();
+			if (likeStr.includes("K") || likeStr.includes("M")) {
+				views = parseNumberSuffix(likeStr);
+			} else {
+				views = parseInt(likeStr) || 0;
+			}
+		}
+
+		// Extract video sources from mediaDefinitions
+		var sources = [];
+		if (short.mediaDefinitions && Array.isArray(short.mediaDefinitions)) {
+			short.mediaDefinitions.forEach(function (mediaDefinition) {
+				if (mediaDefinition.format === "hls" && mediaDefinition.videoUrl) {
+					var quality = mediaDefinition.quality;
+					var resolution = supportedResolutions[quality];
+					if (resolution) {
+						sources.push(new HLSSource({
+							name: quality + "p",
+							url: mediaDefinition.videoUrl,
+							duration: duration,
+							priority: mediaDefinition.defaultQuality === true,
+							requestModifier: { headers: { "Referer": URL_BASE + "/" } }
+						}));
+					}
+				}
+			});
+		}
+
+		// If we have sources, return PlatformVideoDetails (playable)
+		// If no sources, return PlatformVideo (metadata only)
+		if (sources.length > 0) {
+			resultArray.push(new PlatformVideoDetails({
+				id: new PlatformID(PLATFORM, videoId, config.id),
+				name: title ?? "",
+				thumbnails: new Thumbnails([new Thumbnail(thumbnailUrl, 0)]),
+				author: new PlatformAuthorLink(new PlatformID(PLATFORM, authorName, config.id),
+					authorName,
+					authorUrl,
+					""),
+				datetime: undefined,
+				duration: duration,
+				viewCount: views,
+				url: videoUrl.startsWith("http") ? videoUrl : URL_BASE + videoUrl,
+				isLive: false,
+				isShort: true,
+				description: "",
+				video: new VideoSourceDescriptor(sources),
+				rating: new RatingLikes(parseInt(short.likeNumber) || 0)
+			}));
+		} else {
+			// No sources available, return metadata only
+			resultArray.push(new PlatformVideo({
+				id: new PlatformID(PLATFORM, videoId, config.id),
+				name: title ?? "",
+				thumbnails: new Thumbnails([new Thumbnail(thumbnailUrl, 0)]),
+				author: new PlatformAuthorLink(new PlatformID(PLATFORM, authorName, config.id),
+					authorName,
+					authorUrl,
+					""),
+				datetime: undefined,
+				duration: duration,
+				viewCount: views,
+				url: videoUrl.startsWith("http") ? videoUrl : URL_BASE + videoUrl,
+				isLive: false,
+				isShort: true
+			}));
+		}
+	});
+
+	log(`Found ${resultArray.length} shorts`);
+
+	// Always hasMore=true since each fetch returns new random shorts
+	var hasMore = resultArray.length > 0;
+
+	return new PornhubVideoPager(resultArray, hasMore, "/shorties", {}, 1);
+}
+
+
+
+/**
+ * Detect if the HTML response is a bot detection challenge page
+ * @param {string} html - The HTML response body
+ * @returns {boolean} - True if it's a challenge page
+ */
+function isBotChallenge(html) {
+	return html.includes("function leastFactor(n)") && html.includes("document.cookie=\"KEY=");
+}
+
+/**
+ * Solve PornHub's bot detection challenge using eval()
+ * @param {string} html - The challenge page HTML
+ * @returns {string|null} - The KEY cookie value, or null if solving failed
+ */
+function solveBotChallenge(html) {
+	try {
+		log("Solving bot detection challenge...");
+
+		// Extract the JavaScript challenge code
+		var scriptStart = html.indexOf("<script type=\"text/javascript\">");
+		var scriptEnd = html.indexOf("</script>", scriptStart);
+		if (scriptStart === -1 || scriptEnd === -1) {
+			log("Could not find script tags in challenge");
+			return null;
+		}
+
+		var scriptContent = html.substring(scriptStart + 31, scriptEnd);
+
+		// Remove HTML comments (<!-- and -->)
+		scriptContent = scriptContent.replace(/<!--/g, "").replace(/-->/g, "");
+
+		// Replace document.cookie assignment with a return statement
+		// Original: document.cookie="KEY="+n+"*"+p/n+":"+s+":2234595840:1;path=/;";
+		// We want to capture: n+"*"+p/n+":"+s+":2234595840:1"
+		scriptContent = scriptContent.replace(
+			/document\.cookie\s*=\s*"KEY="\s*\+\s*([^;]+);/,
+			'return $1;'
+		);
+
+		// Remove document.location.reload
+		scriptContent = scriptContent.replace(/document\.location\.reload\([^)]*\);?/g, "");
+
+		// Wrap in a function that calls go() and returns the result
+		var solverCode = scriptContent + "\nreturn go();";
+
+		log("Executing challenge code...");
+
+		// Execute the challenge using eval
+		var keyCookieValue = eval("(function() { " + solverCode + " })()");
+
+		if (keyCookieValue) {
+			log("Challenge solved: KEY=" + keyCookieValue.substring(0, 20) + "...");
+			return keyCookieValue;
+		} else {
+			log("Challenge execution returned no value");
+			return null;
+		}
+	} catch (e) {
+		log("Failed to solve bot challenge: " + e);
+		return null;
+	}
+}
+
+// the only things you need for a valid session are as follows:
+// 1.) token
+// 2.) cookies: __l, __s, and ss
+// this will allow you to get search suggestions!!
+function refreshSession() {
+	const resp = http.GET(URL_BASE, headers, true);
+	if (!resp.isOk)
+		throw new ScriptException("Failed request [" + URL_BASE + "] (" + resp.code + ")");
+	else {
+		var dom = domParser.parseFromString(resp.body);
+
+		// Extract token from search input
+		const searchInput = dom.querySelector("#searchInput");
+		if (searchInput) {
+			state.token = searchInput.getAttribute("data-token");
+			log("Token extracted: " + (state.token ? state.token.substring(0, 20) + "..." : "null"));
+		} else {
+			log("Warning: #searchInput not found, token extraction failed");
+		}
+
+		// Extract session ID from meta tag
+		var sessionId = "";
+		const metaTag = dom.querySelector("meta[name=\"adsbytrafficjunkycontext\"]");
+		if (metaTag) {
+			const adContextInfo = metaTag.getAttribute("data-info");
+			sessionId = JSON.parse(adContextInfo)["session_id"];
+			state.sessionCookie = sessionId;
+			log("Session ID extracted: ss=" + sessionId.substring(0, 10) + "...");
+		} else {
+			log("Warning: meta tag not found, session ID extraction failed");
+		}
+
+		// Extract cookies from response headers
+		// The __l and __s cookies are essential for autocomplete to work
+		var cookiesFromHeaders = [];
+		log("Response headers available: " + (resp.headers ? "yes" : "no"));
+		if (resp.headers) {
+			log("Headers keys: " + Object.keys(resp.headers).join(", "));
+			if (resp.headers["set-cookie"]) {
+				var setCookieHeaders = resp.headers["set-cookie"];
+				log("set-cookie header found, type: " + typeof setCookieHeaders);
+				if (typeof setCookieHeaders === 'string') {
+					setCookieHeaders = [setCookieHeaders];
+				}
+
+				for (var i = 0; i < setCookieHeaders.length; i++) {
+					var cookieHeader = setCookieHeaders[i];
+					// Extract cookie name and value (format: "name=value; path=/; ...")
+					var cookieParts = cookieHeader.split(';')[0].trim();
+					cookiesFromHeaders.push(cookieParts);
+					log("Extracted cookie: " + cookieParts);
+				}
+			} else {
+				log("No set-cookie header found");
+			}
+		}
+
+		// Build the complete cookie string
+		// Start with required cookies
+		var cookieString = "platform=pc; accessAgeDisclaimerPH=2";
+
+		// Preserve any auth cookies that were captured by Grayjay's
+		// login web view (il, phn, etc) -- without these, the user
+		// appears logged-out after a session refresh.
+		try {
+			var prev = headers["Cookie"] || "";
+			prev.split(";").forEach(function (p) {
+				var part = p.trim();
+				if (!part) return;
+				var name = part.split("=")[0];
+				if (AUTH_COOKIE_NAMES.indexOf(name) >= 0) {
+					cookieString += "; " + part;
+				}
+			});
+		} catch (e) { /* ignore */ }
+
+		// Add cookies from response headers (__l, __s, etc.)
+		for (var i = 0; i < cookiesFromHeaders.length; i++) {
+			cookieString += "; " + cookiesFromHeaders[i];
+		}
+
+		// Add session ID if we got one from meta tag
+		if (sessionId) {
+			cookieString += "; ss=" + sessionId;
+		}
+
+		headers["Cookie"] = cookieString;
+		log("Session refreshed - token: " + (state.token ? "present" : "empty") + ", cookies set: " + cookiesFromHeaders.length);
+	}
+}
+
+function getVideoId(dom) {
+	var videoId =  dom.querySelector("div#player").getAttribute("data-video-id");
+	return videoId
+}
+
+source.getComments = function (url) {
+	var html = httpGET(url, {});
+	var dom = domParser.parseFromString(html);
+	var videoId = getVideoId(dom);
+
+	return getCommentPager(`/comment/show?id=${videoId}&popular=0&what=video&token=${state.token}`, {}, 1);
+}
+
+source.getSubComments = function (comment) {
+	throw new ScriptException("This is a sample");
+}
+
+function parseStringWithKorMSuffixes(subscriberString) {
+    const numericPart = parseFloat(subscriberString);
+
+    if (subscriberString.includes("K")) {
+        return Math.floor(numericPart * 1000);
+    } else if (subscriberString.includes("M")) {
+        return Math.floor(numericPart * 1000000);
+    } else {
+        return Math.floor(numericPart);
     }
-    // array of {name,value}
-    if (Array.isArray(cookies)) {
-        for (let i = 0; i < cookies.length; i++) {
-            const c = cookies[i];
-            if (c && c.name && c.value) {
-                for (let j = 0; j < AUTH_COOKIE_NAMES.length; j++) {
-                    const n = AUTH_COOKIE_NAMES[j];
-                    if (c.name === n || c.name.indexOf(n + ".") === 0) return true;
+}
+
+
+
+
+function getCommentPager(path, params, page) {
+	log(`getCommentPager page=${page}`, params)
+
+	const count = 10;
+	const page_end = (page ?? 1) * count;
+	params = { ... params, page }
+
+	const url = URL_BASE + path;
+	const urlWithParams = `${url}${buildQuery(params)}`;
+
+	// Comment API requires a valid token in the URL path
+	var html = httpGET(urlWithParams, { requireToken: true });
+
+	var comments = getComments(html);
+	// if no comments, return empty page
+	if (comments.total === 0) return new PornhubCommentPager();
+	
+	return new PornhubCommentPager(comments.comments.map(c => {
+		return new Comment({
+			author: new PlatformAuthorLink(new PlatformID(PLATFORM, c.username, config.id), 
+				c.username, 
+				"", 
+				c.avatar,
+				"",),
+			message: c.message,
+			rating: new RatingLikesDislikes(c.voteUp, c.voteDown),
+			date: Math.round(c.date.getTime() / 1000),
+			replyCount: c.totalReplies,
+			context: { id: c.id }
+		});
+	}), comments.total > page_end, path, params, page);
+}
+
+
+
+
+function getComments(html) {
+
+	var dom = domParser.parseFromString(html);
+
+	var comments = []
+
+	const total = parseInt(dom.querySelector("div#cmtWrapper div.cmtHeader h2 span").textContent.trim().replace("(", "").replace(")", ""));
+	if (total > 0) {
+		// Loop through each comment block
+		// todo nested blocks
+		dom.querySelectorAll('div#cmtContent div.commentBlock').forEach(commentBlock => {
+			const id = commentBlock.getAttribute("class").match(/commentTag(\d+)/)[1];
+
+			const avatar = commentBlock.querySelector("img").getAttribute("src");
+			const username = commentBlock.querySelector('.usernameLink').textContent.trim();
+			const date = parseRelativeDate(commentBlock.querySelector('div.date').textContent.trim());
+			const message = commentBlock.querySelector('.commentMessage span').textContent.trim();
+			const voteUp = parseInt(commentBlock.querySelector('span.voteTotal').textContent.trim());
+			var isVoteDownPresent = commentBlock.querySelectorAll('div.actionButtonsBlock span') !== null;
+
+			var voteDown = 0;
+			if (isVoteDownPresent) {
+				voteDown = parseInt(commentBlock.querySelectorAll('div.actionButtonsBlock span')[1].textContent.trim());
+			}
+
+			// Push comment details to the comments array
+			comments.push({
+				id,
+				avatar,
+				username,
+				date,
+				message,
+				voteUp,
+				voteDown
+			});
+		});
+
+
+		return {
+			total: total,
+			comments: comments
+		};
+
+	} else {
+
+		return {
+			total: 0,
+			comments: 0
+		};
+	}
+
+}
+
+
+/**
+ * Normalize PornHub URL by removing country-specific subdomains
+ * @param {string} url - The URL to normalize
+ * @returns {string} - Normalized URL with www.pornhub.com
+ */
+function normalizePornhubUrl(url) {
+	if (!url) return url;
+
+	// Replace any country-specific subdomain (rt.pornhub.com, de.pornhub.com, etc.) with www.pornhub.com
+	// Also handles urls without subdomain (pornhub.com -> www.pornhub.com)
+	return url.replace(/https?:\/\/([a-z]{2}\.)?pornhub\.com/, "https://www.pornhub.com");
+}
+
+/**
+ * Extract platform name from URL
+ * @param {string} url - The URL to extract platform from
+ * @param {string} label - Optional label from the page
+ * @returns {string} - Platform name or "Website"
+ */
+function extractPlatformName(url, label) {
+	try {
+		// If label is provided and meaningful, use it
+		if (label && label !== "") {
+			return label;
+		}
+
+		// Extract domain from URL
+		var domain = url.replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0].toLowerCase();
+
+		// Map of domain patterns to friendly names
+		var platformMap = {
+			'twitter.com': 'Twitter',
+			'x.com': 'Twitter',
+			'instagram.com': 'Instagram',
+			'tiktok.com': 'TikTok',
+			'youtube.com': 'YouTube'
+		};
+
+		// Check if domain matches any known platform
+		for (var pattern in platformMap) {
+			if (domain.includes(pattern)) {
+				return platformMap[pattern];
+			}
+		}
+
+		// For unknown domains, capitalize the first part of the domain
+		var domainParts = domain.split('.');
+		if (domainParts.length > 0) {
+			var name = domainParts[0];
+			return name.charAt(0).toUpperCase() + name.slice(1);
+		}
+
+		return "Website";
+	} catch (e) {
+		return "Website";
+	}
+}
+
+function parseRelativeDate(relativeDate) {
+    const now = new Date();
+    const lowerCaseRelativeDate = relativeDate.toLowerCase();
+
+    if (lowerCaseRelativeDate.includes('1 second ago')) {
+        return new Date(now - 1000);
+    } else if (lowerCaseRelativeDate.includes('1 minute ago')) {
+        return new Date(now - 60 * 1000);
+    } else if (lowerCaseRelativeDate.includes('1 hour ago')) {
+        return new Date(now - 60 * 60 * 1000);
+    } else if (lowerCaseRelativeDate.includes('1 day ago')) {
+        return new Date(now - 24 * 60 * 60 * 1000);
+    } else if (lowerCaseRelativeDate.includes('yesterday')) {
+        return new Date(now - 24 * 60 * 60 * 1000);
+    } else if (lowerCaseRelativeDate.includes('1 week ago')) {
+        return new Date(now - 7 * 24 * 60 * 60 * 1000);
+    } else if (lowerCaseRelativeDate.includes('1 month ago')) {
+        const oneMonthAgo = new Date(now);
+        oneMonthAgo.setMonth(now.getMonth() - 1);
+        return oneMonthAgo;
+    } else if (lowerCaseRelativeDate.includes('1 year ago')) {
+        const oneYearAgo = new Date(now);
+        oneYearAgo.setFullYear(now.getFullYear() - 1);
+        return oneYearAgo;
+    } else if (lowerCaseRelativeDate.includes('seconds ago')) {
+        const secondsAgo = parseInt(lowerCaseRelativeDate);
+        return new Date(now - secondsAgo * 1000);
+    } else if (lowerCaseRelativeDate.includes('minutes ago')) {
+        const minutesAgo = parseInt(lowerCaseRelativeDate);
+        return new Date(now - minutesAgo * 60 * 1000);
+    } else if (lowerCaseRelativeDate.includes('hours ago')) {
+        const hoursAgo = parseInt(lowerCaseRelativeDate);
+        return new Date(now - hoursAgo * 60 * 60 * 1000);
+    } else if (lowerCaseRelativeDate.includes('days ago')) {
+        const daysAgo = parseInt(lowerCaseRelativeDate);
+        return new Date(now - daysAgo * 24 * 60 * 60 * 1000);
+    } else if (lowerCaseRelativeDate.includes('weeks ago')) {
+        const weeksAgo = parseInt(lowerCaseRelativeDate);
+        return new Date(now - weeksAgo * 7 * 24 * 60 * 60 * 1000);
+    } else if (lowerCaseRelativeDate.includes('months ago')) {
+        const monthsAgo = parseInt(lowerCaseRelativeDate);
+        const oneMonthAgo = new Date(now);
+        oneMonthAgo.setMonth(now.getMonth() - monthsAgo);
+        return oneMonthAgo;
+    } else if (lowerCaseRelativeDate.includes('years ago')) {
+        const yearsAgo = parseInt(lowerCaseRelativeDate);
+        const oneYearAgo = new Date(now);
+        oneYearAgo.setFullYear(now.getFullYear() - yearsAgo);
+        return oneYearAgo;
+    }
+
+	// Handle additional cases or return null if the format is not recognized
+    return 0;
+}
+
+
+function getChannelInfo(url) {
+	var html = httpGET(url, {});
+	let dom = domParser.parseFromString(html);
+
+	const avatarElement = dom.getElementById("getAvatar");
+	var channelThumbnail = avatarElement ? avatarElement.getAttribute("src") : "";
+
+	const bannerElement = dom.getElementById("coverPictureDefault");
+	var channelBanner = bannerElement ? bannerElement.getAttribute("src") : "";
+
+	const nameElement = dom.querySelector("h1");
+	var channelName = nameElement ? nameElement.textContent.trim() : "";
+
+	var statsNode = dom.getElementById("stats");
+
+	var channelSubscribers = (statsNode && statsNode.childNodes[1]) ? parseInt(statsNode.childNodes[1].textContent.trim().replace(/,/g, '')) : 0;
+	var channelViews = (statsNode && statsNode.childNodes[0]) ? parseInt(statsNode.childNodes[0].textContent.trim().replace(/,/g, '')) : 0;
+	var channelVideos = (statsNode && statsNode.childNodes[2]) ? parseInt(statsNode.childNodes[2].textContent.trim().split(" ")[0].replace(/,/g, '')) : 0;
+
+	const descElement = dom.querySelector(".cdescriptions");
+	var channelDescription = (descElement && descElement.childNodes[0]) ? descElement.childNodes[0].textContent.trim() : "";
+
+	// Add channel stats to description
+	if (channelViews > 0 || channelVideos > 0 || channelSubscribers > 0) {
+		channelDescription += "\n\n📊 Channel Stats:";
+		if (channelVideos > 0) {
+			channelDescription += "\n• Total Videos: " + channelVideos.toLocaleString();
+		}
+		if (channelViews > 0) {
+			channelDescription += "\n• Total Views: " + channelViews.toLocaleString();
+		}
+		if (channelSubscribers > 0) {
+			channelDescription += "\n• Subscribers: " + channelSubscribers.toLocaleString();
+		}
+	}
+
+	// Extract social media links
+	var channelLinks = {};
+	var socialLinksSection = dom.querySelector(".socialLinksSection, section.socialLinksSection");
+	if (socialLinksSection) {
+		var socialLinks = socialLinksSection.querySelectorAll("ul.socialList li a");
+		socialLinks.forEach(function(link) {
+			var href = link.getAttribute("href");
+			if (href && !href.includes("pornhub.com")) {
+				var linkText = link.querySelector(".socialText");
+				var label = linkText ? linkText.textContent.trim() : "";
+
+				// Extract platform name from URL domain
+				var platformName = extractPlatformName(href, label);
+
+				// Use the label if available, otherwise use the extracted platform name
+				var linkLabel = label || platformName;
+
+				if (linkLabel) {
+					channelLinks[linkLabel] = href;
+				}
+			}
+		});
+	}
+
+	return {
+		channelName: channelName,
+		channelThumbnail: channelThumbnail,
+		channelBanner: channelBanner,
+		channelSubscribers: channelSubscribers,
+		channelDescription: channelDescription,
+		channelUrl: normalizePornhubUrl(url),
+		channelLinks: channelLinks
+	}
+}
+
+
+
+function getPornstarInfo(url) {
+	var html = httpGET(url, {});
+	let dom = domParser.parseFromString(html);
+
+	const avatarElement = dom.getElementById("getAvatar");
+	const channelThumbnail = avatarElement ? avatarElement.getAttribute("src") : "";
+
+	const bannerElement = dom.getElementById("coverPictureDefault");
+	const channelBanner = bannerElement ? bannerElement.getAttribute("src") : "";
+
+	const nameElement = dom.querySelector("div.name > h1");
+	const channelName = nameElement ? nameElement.textContent.trim() : "";
+
+	var channelDescription = "";
+	const aboutSection = dom.querySelector("section.aboutMeSection");
+	if (aboutSection) {
+		var divs = aboutSection.querySelectorAll("div");
+		for (var i = 0; i < divs.length; i++) {
+			if (!divs[i].getAttribute("class")) {
+				channelDescription = divs[i].textContent;
+				break;
+			}
+		}
+	}
+
+	const statsNode = dom.querySelector("div.infoBoxes");
+	const channelSubscribers = statsNode ? parseNumberSuffix(statsNode.querySelector("div[data-title^=Subscribers] > span.big").textContent.trim()) : 0;
+	const channelViews = statsNode ? parseNumberSuffix(statsNode.querySelector("div[data-title^=Video] > span.big").textContent.trim()) : 0;
+
+	// Try to get video count from the stats node
+	var channelVideos = 0;
+	const videoCountElement = dom.querySelector("div.pornstarVideosCounter span.big, div.videosCounter span");
+	if (videoCountElement) {
+		const videoCountText = videoCountElement.textContent.trim();
+		channelVideos = videoCountText.includes("K") || videoCountText.includes("M") ? parseNumberSuffix(videoCountText) : parseInt(videoCountText.replace(/,/g, '')) || 0;
+	}
+
+	// Add channel stats to description
+	if (channelViews > 0 || channelVideos > 0 || channelSubscribers > 0) {
+		channelDescription += "\n\n📊 Channel Stats:";
+		if (channelVideos > 0) {
+			channelDescription += "\n• Total Videos: " + channelVideos.toLocaleString();
+		}
+		if (channelViews > 0) {
+			channelDescription += "\n• Total Views: " + channelViews.toLocaleString();
+		}
+		if (channelSubscribers > 0) {
+			channelDescription += "\n• Subscribers: " + channelSubscribers.toLocaleString();
+		}
+	}
+
+	// Extract social media links
+	var channelLinks = {};
+	var socialLinksSection = dom.querySelector(".socialLinksSection, section.socialLinksSection");
+	if (socialLinksSection) {
+		var socialLinks = socialLinksSection.querySelectorAll("ul.socialList li a");
+		socialLinks.forEach(function(link) {
+			var href = link.getAttribute("href");
+			if (href && !href.includes("pornhub.com")) {
+				var linkText = link.querySelector(".socialText");
+				var label = linkText ? linkText.textContent.trim() : "";
+
+				// Extract platform name from URL domain
+				var platformName = extractPlatformName(href, label);
+
+				// Use the label if available, otherwise use the extracted platform name
+				var linkLabel = label || platformName;
+
+				if (linkLabel) {
+					channelLinks[linkLabel] = href;
+				}
+			}
+		});
+	}
+
+	return {
+		channelName: channelName,
+		channelThumbnail: channelThumbnail,
+		channelBanner: channelBanner,
+		channelSubscribers: channelSubscribers,
+		channelDescription: channelDescription,
+		channelUrl: normalizePornhubUrl(url),
+		channelLinks: channelLinks
+	}
+}
+
+
+
+
+class PornhubVideoPager extends VideoPager {
+	constructor(results, hasMore, path, params, page) {
+		super(results, hasMore, { path, params,  page});
+	}
+
+	nextPage() {
+		// For shorts, call getShortsPager to get fresh random shorts
+		if (this.context.path === "/shorties") {
+			return getShortsPager(0, 12);
+		}
+		return getVideoPager(this.context.path, this.context.params, (this.context.page ?? 1) + 1);
+	}
+}
+
+
+class PornhubChannelVideosPager extends VideoPager {
+	constructor(results, hasMore, path, params, page) {
+		super(results, hasMore, { path, params,  page});
+	}
+
+	nextPage() {
+		if(this.context.path.includes("/channels/")) {
+			return getChannelVideosPager(this.context.path, this.context.params, (this.context.page ?? 1) + 1);
+		} else if(this.context.path.includes("/model/")) {
+			return getModelVideosPager(this.context.path, this.context.params, (this.context.page ?? 1) + 1);
+		}
+		else {
+			return getPornstarVideosPager(this.context.path, this.context.params, (this.context.page ?? 1) + 1);
+		}
+	}
+}
+
+
+
+class PornhubChannelPager extends ChannelPager {
+	constructor(results, hasMore, path, params, page) {
+		super(results, hasMore, { path, params, page });
+	}
+	
+	nextPage() {
+		return getChannelPager(this.context.path, this.context.params, (this.context.page ?? 1) + 1);
+	}
+}
+
+
+class PornhubCommentPager extends CommentPager {
+	constructor(results, hasMore, path, params, page) {
+		super(results, hasMore, { path, params, page });
+	}
+
+	nextPage() {
+		return getCommentPager(this.context.path, this.context.params, (this.context.page ?? 1) + 1);
+	}
+}
+
+// Multi-channel pager for combined pornstars/models/channels search
+class PornhubMultiChannelPager extends ChannelPager {
+	constructor(results, hasMore, query, page) {
+		super(results, hasMore, { query, page });
+	}
+
+	nextPage() {
+		return getMultiChannelPager(this.context.query, (this.context.page ?? 1) + 1);
+	}
+}
+
+// Use autocomplete API for channel search (no bot detection, no pagination issues!)
+function getAutocompleteChannelPager(query) {
+	try {
+		// Build autocomplete API URL
+		var apiUrl = URL_BASE + "/api/v1/video/search_autocomplete?pornstars=true&token=" + state.token + "&orientation=straight&q=" + encodeURIComponent(query) + "&alt=0";
+		log("Fetching channel search from autocomplete: " + apiUrl);
+
+		// Use httpGET with options object
+		var json = httpGET(apiUrl, {
+			headers: {
+				"Cookie": headers["Cookie"],
+				"User-Agent": headers["User-Agent"],
+				"Accept": "*/*",
+				"Accept-Language": "en-US,en;q=0.5",
+				"Referer": URL_BASE + "/",
+				"X-Requested-With": "XMLHttpRequest",
+				"Content-Type": "application/x-www-form-urlencoded"
+			},
+			requireToken: true,
+			parseJson: true,
+			retries: 3
+		});
+
+		var allChannels = [];
+
+		// Add models
+		if (json.models && Array.isArray(json.models)) {
+			json.models.forEach(function(model) {
+				allChannels.push(new PlatformAuthorLink(
+					new PlatformID(PLATFORM, model.slug, config.id),
+					model.name,
+					URL_BASE + "/model/" + model.slug,
+					"", // No avatar in autocomplete API
+					0   // No subscribers in autocomplete API
+				));
+			});
+			log(`Found ${json.models.length} models`);
+		}
+
+		// Add pornstars
+		if (json.pornstars && Array.isArray(json.pornstars)) {
+			json.pornstars.forEach(function(pornstar) {
+				allChannels.push(new PlatformAuthorLink(
+					new PlatformID(PLATFORM, pornstar.slug, config.id),
+					pornstar.name,
+					URL_BASE + "/pornstar/" + pornstar.slug,
+					"", // No avatar in autocomplete API
+					0   // No subscribers in autocomplete API
+				));
+			});
+			log(`Found ${json.pornstars.length} pornstars`);
+		}
+
+		// Add channels
+		if (json.channels && Array.isArray(json.channels)) {
+			json.channels.forEach(function(channel) {
+				allChannels.push(new PlatformAuthorLink(
+					new PlatformID(PLATFORM, channel.slug, config.id),
+					channel.name,
+					URL_BASE + "/channels/" + channel.slug,
+					"", // No avatar in autocomplete API
+					0   // No subscribers in autocomplete API
+				));
+			});
+			log(`Found ${json.channels.length} channels`);
+		}
+
+		log(`Found ${allChannels.length} total creators from autocomplete`);
+
+		// Autocomplete doesn't support pagination, so hasMore is always false
+		return new PornhubMultiChannelPager(allChannels, false, query, 1);
+	} catch(e) {
+		log("Channel search failed: " + e);
+		return new PornhubMultiChannelPager([], false, query, 1);
+	}
+}
+
+// Search both pornstars and channels (OLD METHOD - using HTML scraping with bot detection)
+function getMultiChannelPager(query, page) {
+	log(`getMultiChannelPager query=${query} page=${page}`);
+
+	var allChannels = [];
+	var hasMore = false;
+
+	// Search pornstars
+	try {
+		var pornstarHtml = httpGET(URL_BASE + "/pornstars/search?search=" + encodeURIComponent(query) + "&page=" + page, {});
+		var pornstars = getPornstarsFromSearch(pornstarHtml);
+		allChannels = allChannels.concat(pornstars.channels);
+		hasMore = hasMore || pornstars.hasNextPage;
+		log(`Found ${pornstars.channels.length} pornstars`);
+	} catch(e) {
+		log("Failed to search pornstars: " + e);
+	}
+
+	// Search channels
+	try {
+		var channelHtml = httpGET(URL_BASE + "/channels/search?channelSearch=" + encodeURIComponent(query) + "&page=" + page, {});
+		var channels = getChannels(channelHtml);
+		allChannels = allChannels.concat(channels.channels);
+		hasMore = hasMore || channels.hasNextPage;
+		log(`Found ${channels.channels.length} channels`);
+	} catch(e) {
+		log("Failed to search channels: " + e);
+	}
+
+	log(`Found ${allChannels.length} total creators`);
+
+	return new PornhubMultiChannelPager(allChannels.map(c => {
+		return new PlatformAuthorLink(new PlatformID(PLATFORM, c.name, config.id),
+			c.displayName,
+			URL_BASE + c.url,
+			c.avatar ?? "",
+			c.subscribers);
+	}), hasMore, query, page);
+}
+
+// Parse pornstars from search results
+function getPornstarsFromSearch(html) {
+	var dom = domParser.parseFromString(html);
+	var resultArray = [];
+
+	// Try multiple possible selectors for pornstar search results
+	var pornstarElements = dom.querySelectorAll("div.pornstarsSearchResult li, ul.pornstars-list li, li.pornstar-item, div.performerCard");
+
+	if (pornstarElements.length === 0) {
+		log("No pornstar elements found with standard selectors");
+		return { hasNextPage: false, channels: [] };
+	}
+
+	pornstarElements.forEach(function(li) {
+		var linkElement = li.querySelector("a");
+		if (!linkElement) return;
+
+		var url = linkElement.getAttribute("href");
+		if (!url || !url.includes("/pornstar/")) return;
+
+		var imgElement = li.querySelector("img");
+		var avatar = imgElement ? (imgElement.getAttribute("data-src") || imgElement.getAttribute("src") || "") : "";
+
+		// Try different selectors for name
+		var nameElement = li.querySelector(".pornStarName, .performerCardName, .title");
+		var displayName = nameElement ? nameElement.textContent.trim() : "";
+		if (!displayName && linkElement.getAttribute("title")) {
+			displayName = linkElement.getAttribute("title");
+		}
+
+		// Try different selectors for subscriber count
+		var rankElement = li.querySelector(".rank_number, .subscribers, .subscribersText");
+		var subscribers = 0;
+		if (rankElement) {
+			var subsText = rankElement.textContent.trim();
+			subscribers = subsText.includes("K") || subsText.includes("M") ? parseNumberSuffix(subsText) : parseInt(subsText) || 0;
+		}
+
+		var name = url ? url.split("/").filter(s => s).pop() : displayName;
+
+		if (url && displayName) {
+			resultArray.push({
+				subscribers: subscribers,
+				name: name,
+				url: url,
+				displayName: displayName,
+				avatar: avatar
+			});
+		}
+	});
+
+	var hasNextPage = false;
+	var pageNextNode = dom.querySelector("li.page_next a, a.page-next, .pagination a.next");
+	if (pageNextNode && pageNextNode.getAttribute("href") && pageNextNode.getAttribute("href") !== "") {
+		hasNextPage = true;
+	}
+
+	log(`getPornstarsFromSearch: Found ${resultArray.length} pornstars`);
+
+	return {
+		hasNextPage: hasNextPage,
+		channels: resultArray
+	};
+}
+
+
+function getChannelPager(path, params, page) {
+
+	log(`getChannelPager page=${page}`, params)
+
+	const count = 40;
+	const page_end = (page ?? 1) * count;
+	params = { ... params, page }
+
+	const url = URL_BASE + path;
+	const urlWithParams = `${url}${buildQuery(params)}`;
+
+	var html = httpGET(urlWithParams, {});
+
+	var channels = getChannels(html, "searchChannelsSection");
+
+
+	return new PornhubChannelPager(channels.channels.map(c => {
+			return new PlatformAuthorLink(new PlatformID(PLATFORM, c.name, config.id), 
+				c.displayName, 
+				URL_BASE + c.url, 
+				c.avatar ?? "",
+				c.subscribers);
+		}), channels.hasNextPage, path, params, page);
+}
+
+function getChannels(html) {
+
+	var dom = domParser.parseFromString(html);
+
+	var resultArray = []
+
+	dom.getElementById("searchChannelsSection").childNodes.forEach((li) => {
+
+			var avatar = li.querySelector("div.avatar a.usernameLink img").getAttribute("src");
+			var displayName = li.querySelector("div.descriptionContainer li a.usernameLink").textContent.trim()
+			var url = li.querySelector("div.descriptionContainer li a.usernameLink").getAttribute("href");
+			var subscribers = parseInt(li.querySelector("div.descriptionContainer li span").textContent.trim().replace(/\,/, ""));
+			var name = url.split("/")[1];
+
+			resultArray.push({
+				subscribers: subscribers,
+				name: name,
+				url: url,
+				displayName: displayName,
+				avatar: avatar,
+			});
+	});
+	
+
+	var hasNextPage = false; 
+	var pageNextNode = dom.getElementsByClassName("page_next");
+	if (pageNextNode.length > 0) {
+		hasNextPage = pageNextNode[0].firstChild.getAttribute("href") == "" ? false : true;
+	}
+
+	return {
+		hasNextPage: hasNextPage,
+		channels: resultArray
+	};
+}
+
+// todo: maybe improve?
+function getChannelVideosPager(path, params, page) {
+	log(`getChannelVideosPager page=${page}`, params)
+
+	const count = 36;
+	const page_end = (page ?? 1) * count;
+	params = { ... params, page }
+
+	const url = path;
+	const urlWithParams = `${url}${buildQuery(params)}`;
+
+	var html = httpGET(urlWithParams, {});
+
+	// Use getVideos() with class selector since channel pages use the same structure as regular video pages
+	var dom = domParser.parseFromString(html);
+
+	// Try specific IDs first (these are guaranteed to have videos)
+	var ulElement = dom.getElementById("mostRecentVideosSection") || dom.getElementById("moreData");
+
+	// If no ID found, try querySelectorAll and find first non-empty ul
+	if (!ulElement) {
+		var ulElements = dom.querySelectorAll("ul.full-row-thumbs.videos, ul.videos.full-row-thumbs");
+		for (var i = 0; i < ulElements.length; i++) {
+			var testUl = ulElements[i];
+			if (testUl.querySelectorAll("li.pcVideoListItem").length > 0) {
+				ulElement = testUl;
+				break;
+			}
+		}
+	}
+
+	if (!ulElement) {
+		log("Warning: Could not find ul.full-row-thumbs.videos, trying old getChannelContents method");
+		var vids = getChannelContents(html);
+		return _buildPornhubChannelVideosPager(vids, vids.totalElemsPages > page_end, path, params, page);
+	}
+
+	// Parse videos using the same logic as getVideos but adapted for channel pages
+	var resultArray = [];
+	var authorName = path.split("/")[4]; // Extract channel name from path
+	var authorInfo = {
+		authorName: authorName,
+		avatar: ""
+	};
+
+	ulElement.querySelectorAll("li.pcVideoListItem").forEach(function (li) {
+		const videoId = li.getAttribute("data-video-id");
+		if (videoId && !isNaN(videoId)) {
+			const aElement = li.querySelector('a.js-linkVideoThumb');
+			if (aElement) {
+				const videoUrl = aElement.getAttribute('href');
+				const imgElement = aElement.querySelector('img');
+				if (imgElement && videoUrl) {
+					const thumbnailUrl = imgElement.getAttribute('src');
+					const title = imgElement.getAttribute("alt") || imgElement.getAttribute("data-title") || aElement.getAttribute("data-title");
+					const durationVar = aElement.querySelector(".duration");
+					const durationStr = durationVar ? durationVar.textContent.trim() : "0:00";
+					const duration = parseDuration(durationStr);
+					const viewsSpan = li.querySelector(".views var");
+					const viewsStr = viewsSpan ? viewsSpan.textContent.trim() : "0";
+					const views = parseNumberSuffix(viewsStr);
+
+					resultArray.push({
+						id: videoId,
+						videoUrl: videoUrl,
+						title: title,
+						thumbnailUrl: thumbnailUrl,
+						duration: duration,
+						authorInfo: authorInfo,
+						views: views,
+					});
+				}
+			}
+		}
+	});
+
+	var vids = {
+		videos: resultArray,
+		totalElemsPages: resultArray.length
+	};
+	return _buildPornhubChannelVideosPager(vids, resultArray.length >= count, path, params, page);
+}
+
+function getModelVideosPager(path, params, page) {
+	log(`getModelVideosPager page=${page}`, params)
+	params = { ... params, page }
+
+	const url = path;
+	const urlWithParams = `${url}${buildQuery(params)}`;
+
+	var html = httpGET(urlWithParams, {});
+
+	// Try new structure first (same as regular video pages)
+	var dom = domParser.parseFromString(html);
+
+	// Try specific IDs first (these are guaranteed to have videos)
+	var ulElement = dom.getElementById("mostRecentVideosSection") || dom.getElementById("moreData");
+
+	// If no ID found, try querySelectorAll and find first non-empty ul
+	if (!ulElement) {
+		var ulElements = dom.querySelectorAll("ul.full-row-thumbs.videos, ul.videos.full-row-thumbs");
+		for (var i = 0; i < ulElements.length; i++) {
+			var testUl = ulElements[i];
+			if (testUl.querySelectorAll("li.pcVideoListItem").length > 0) {
+				ulElement = testUl;
+				break;
+			}
+		}
+	}
+
+	if (ulElement) {
+		log("Using new ul.full-row-thumbs.videos structure for model page");
+		var resultArray = [];
+		var authorName = path.split("/")[4]; // Extract model name from path
+		var authorInfo = {
+			authorName: authorName,
+			avatar: ""
+		};
+
+		const count = 40;
+		ulElement.querySelectorAll("li.pcVideoListItem").forEach(function (li) {
+			const videoId = li.getAttribute("data-video-id");
+			if (videoId && !isNaN(videoId)) {
+				const aElement = li.querySelector('a.js-linkVideoThumb');
+				if (aElement) {
+					const videoUrl = aElement.getAttribute('href');
+					const imgElement = aElement.querySelector('img');
+					if (imgElement && videoUrl) {
+						const thumbnailUrl = imgElement.getAttribute('src');
+						const title = imgElement.getAttribute("alt") || imgElement.getAttribute("data-title") || aElement.getAttribute("data-title");
+						const durationVar = aElement.querySelector(".duration");
+						const durationStr = durationVar ? durationVar.textContent.trim() : "0:00";
+						const duration = parseDuration(durationStr);
+						const viewsSpan = li.querySelector(".views var");
+						const viewsStr = viewsSpan ? viewsSpan.textContent.trim() : "0";
+						const views = parseNumberSuffix(viewsStr);
+
+						resultArray.push({
+							id: videoId,
+							videoUrl: videoUrl,
+							title: title,
+							thumbnailUrl: thumbnailUrl,
+							duration: duration,
+							authorInfo: authorInfo,
+							views: views,
+						});
+					}
+				}
+			}
+		});
+
+		var vids = {
+			videos: resultArray,
+			hasNextPage: resultArray.length >= count
+		};
+		return _buildPornhubChannelVideosPager(vids, vids.hasNextPage, path, params, page);
+	}
+
+	// Fallback to old structure
+	log("Using old getModelContents structure for model page");
+	var vids = getModelContents(html);
+	return _buildPornhubChannelVideosPager(vids, vids.hasNextPage, path, params, page)
+}
+
+function getPornstarVideosPager(path, params, page) {
+	log(`getPornstarVideosPager page=${page}`, params)
+
+	const count = 40;
+	const page_end = (page ?? 1) * count;
+	params = { ... params, page }
+
+	const url = path;
+	const urlWithParams = `${url}${buildQuery(params)}`;
+
+	var html = httpGET(urlWithParams, {});
+
+	// Try new structure first (same as regular video pages)
+	var dom = domParser.parseFromString(html);
+
+	// Try specific IDs first (these are guaranteed to have videos)
+	var ulElement = dom.getElementById("mostRecentVideosSection") || dom.getElementById("moreData");
+
+	// If no ID found, try querySelectorAll and find first non-empty ul
+	if (!ulElement) {
+		var ulElements = dom.querySelectorAll("ul.full-row-thumbs.videos, ul.videos.full-row-thumbs");
+		for (var i = 0; i < ulElements.length; i++) {
+			var testUl = ulElements[i];
+			if (testUl.querySelectorAll("li.pcVideoListItem").length > 0) {
+				ulElement = testUl;
+				break;
+			}
+		}
+	}
+
+	if (ulElement) {
+		log("Using new ul.full-row-thumbs.videos structure for pornstar page");
+		var resultArray = [];
+		var authorName = path.split("/")[4]; // Extract pornstar name from path
+		var authorInfo = {
+			authorName: authorName,
+			avatar: ""
+		};
+
+		ulElement.querySelectorAll("li.pcVideoListItem").forEach(function (li) {
+			const videoId = li.getAttribute("data-video-id");
+			if (videoId && !isNaN(videoId)) {
+				const aElement = li.querySelector('a.js-linkVideoThumb');
+				if (aElement) {
+					const videoUrl = aElement.getAttribute('href');
+					const imgElement = aElement.querySelector('img');
+					if (imgElement && videoUrl) {
+						const thumbnailUrl = imgElement.getAttribute('src');
+						const title = imgElement.getAttribute("alt") || imgElement.getAttribute("data-title") || aElement.getAttribute("data-title");
+						const durationVar = aElement.querySelector(".duration");
+						const durationStr = durationVar ? durationVar.textContent.trim() : "0:00";
+						const duration = parseDuration(durationStr);
+						const viewsSpan = li.querySelector(".views var");
+						const viewsStr = viewsSpan ? viewsSpan.textContent.trim() : "0";
+						const views = parseNumberSuffix(viewsStr);
+
+						resultArray.push({
+							id: videoId,
+							videoUrl: videoUrl,
+							title: title,
+							thumbnailUrl: thumbnailUrl,
+							duration: duration,
+							authorInfo: authorInfo,
+							views: views,
+						});
+					}
+				}
+			}
+		});
+
+		var vids = {
+			videos: resultArray,
+			totalElemsPages: resultArray.length
+		};
+		return _buildPornhubChannelVideosPager(vids, resultArray.length >= count, path, params, page);
+	}
+
+	// Fallback to old structure
+	log("Using old getPornstarContents structure for pornstar page");
+	var vids = getPornstarContents(html);
+	return _buildPornhubChannelVideosPager(vids, vids.totalElemsPages > page_end, path, params, page)
+}
+
+function _buildPornhubChannelVideosPager(vids, hasNextPage, path, params, page) {
+	// Extract the channel URL from the path (remove /videos or /videos/upload suffix)
+	var channelUrl = path.replace(/\/videos.*$/, '');
+
+	return new PornhubChannelVideosPager(vids.videos.map(v => {
+		return new PlatformVideo({
+			id: new PlatformID(PLATFORM, v.id, config.id),
+			name: v.title ?? "",
+			thumbnails: new Thumbnails([new Thumbnail(v.thumbnailUrl, 0)]),
+			author: new PlatformAuthorLink(new PlatformID(PLATFORM, v.authorInfo.authorName, config.id),
+				v.authorInfo.authorName,
+				channelUrl,
+				v.authorInfo.avatar),
+			datetime: undefined,
+			duration: v.duration,
+			viewCount: v.views,
+			url: URL_BASE + v.videoUrl,
+			isLive: false
+		});
+
+	}), hasNextPage, path, params, page);
+}
+
+
+function getChannelContents(html) {
+	var dom = domParser.parseFromString(html);
+
+	var statsNodes = dom.querySelectorAll("div#stats div.info.floatRight");
+
+	var total = (statsNodes && statsNodes[2]) ? parseInt(statsNodes[2].textContent.split(" VIDEOS")[0]) : 0;
+
+	var resultArray = []
+
+	const nameElement = dom.querySelector("div.title h1");
+	const avatarElement = dom.querySelector("img#getAvatar");
+
+	var authorInfo = {
+		authorName: nameElement ? nameElement.textContent.trim() : "",
+		avatar: avatarElement ? avatarElement.getAttribute("href") : ""
+	}
+
+	const videosContainer = dom.getElementById("showAllChanelVideos");
+	if (!videosContainer) return { totalElemsPages: total, videos: resultArray };
+
+	videosContainer.childNodes.forEach((li) => {
+		if (!li) return;
+
+		const titleElement = li.querySelector("span.title a");
+		if (!titleElement) return;
+
+		var title = titleElement.textContent.trim();
+		var videoUrl = titleElement.getAttribute("href");
+		if (!videoUrl) return;
+
+		const imgElement = li.querySelector("img");
+		var thumbnailUrl = imgElement ? imgElement.getAttribute("src") : "";
+
+		var videoId = li.getAttribute("data-video-id");
+		if (!videoId) return;
+
+		const durationElement = li.querySelector("var.duration");
+		var duration = durationElement ? parseDuration(durationElement.textContent.trim()) : 0;
+
+		const viewsElement = li.querySelector("div.videoDetailsBlock span.views var");
+		var views = viewsElement ? parseStringWithKorMSuffixes(viewsElement.textContent.trim()) : 0;
+
+		resultArray.push({
+			id: videoId,
+			videoUrl: videoUrl,
+			title: title,
+			thumbnailUrl: thumbnailUrl,
+			duration: duration,
+			authorInfo: authorInfo,
+			views: views,
+		});
+
+	});
+
+	return {
+		totalElemsPages: total,
+		videos: resultArray
+	};
+}
+
+function getPornstarContents(html) {
+	var dom = domParser.parseFromString(html);
+
+	// "Showing 1-40 of 52"
+	const showingInfoElement = dom.querySelector("div.showingInfo");
+	var total = 0;
+	if (showingInfoElement) {
+		var showingInfo = showingInfoElement.textContent.trim();
+		if (showingInfo.length > 0 && showingInfo.includes(" of ")) {
+			// "52"
+			total = parseInt(showingInfo.split(" of ").slice(-1), 10);
+		}
+	}
+
+	var resultArray = []
+
+	const nameElement = dom.querySelector("h1[itemprop=name]");
+	const avatarElement = dom.querySelector("img#getAvatar");
+
+	var authorInfo = {
+		authorName: nameElement ? nameElement.textContent.trim() : "",
+		avatar: avatarElement ? avatarElement.getAttribute("src") : ""
+	}
+
+	const videoListContainer = dom.querySelector("div.videoUList > ul");
+	if (!videoListContainer) return { totalElemsPages: total, videos: resultArray };
+
+	videoListContainer.childNodes.forEach((li) => {
+		if (!li) return;
+
+		const titleElement = li.querySelector("span.title a");
+		if (!titleElement) return;
+
+		var title = titleElement.textContent.trim();
+		var videoUrl = titleElement.getAttribute("href");
+		if (!videoUrl) return;
+
+		const imgElement = li.querySelector("img");
+		var thumbnailUrl = imgElement ? imgElement.getAttribute("src") : "";
+
+		var videoId = li.getAttribute("data-video-id");
+		if (!videoId) return;
+
+		const durationElement = li.querySelector("var.duration");
+		var duration = durationElement ? parseDuration(durationElement.textContent.trim()) : 0;
+
+		const viewsElement = li.querySelector("div.videoDetailsBlock span.views var");
+		var views = viewsElement ? parseStringWithKorMSuffixes(viewsElement.textContent.trim()) : 0;
+
+		resultArray.push({
+			id: videoId,
+			videoUrl: videoUrl,
+			title: title,
+			thumbnailUrl: thumbnailUrl,
+			duration: duration,
+			authorInfo: authorInfo,
+			views: views,
+		});
+
+	});
+
+	return {
+		totalElemsPages: total,
+		videos: resultArray
+	};
+}
+
+function getModelContents(html) {
+	var dom = domParser.parseFromString(html);
+	var hasNextPage;
+
+	const pageNext = dom.querySelector("li.page_next > a");
+	if (pageNext) {
+		hasNextPage = pageNext.getAttribute("href") !== "";
+	} else {
+		hasNextPage = false;
+	}
+
+	var resultArray = []
+
+	const nameElement = dom.querySelector("h1[itemprop=name]");
+	const avatarElement = dom.querySelector("img#getAvatar");
+
+	var authorInfo = {
+		authorName: nameElement ? nameElement.textContent.trim() : "",
+		avatar: avatarElement ? avatarElement.getAttribute("src") : ""
+	}
+
+	const videoListContainer = dom.querySelector("div.videoUList > ul");
+	if (!videoListContainer) return { hasNextPage: hasNextPage, videos: resultArray };
+
+	videoListContainer.childNodes.forEach((li) => {
+		if (!li) return;
+
+		const titleElement = li.querySelector("span.title a");
+		if (!titleElement) return;
+
+		var title = titleElement.textContent.trim();
+		var videoUrl = titleElement.getAttribute("href");
+		if (!videoUrl) return;
+
+		const imgElement = li.querySelector("img");
+		var thumbnailUrl = imgElement ? imgElement.getAttribute("src") : "";
+
+		var videoId = li.getAttribute("data-video-id");
+		if (!videoId) return;
+
+		const durationElement = li.querySelector("var.duration");
+		var duration = durationElement ? parseDuration(durationElement.textContent.trim()) : 0;
+
+		const viewsElement = li.querySelector("div.videoDetailsBlock span.views var");
+		var views = viewsElement ? parseStringWithKorMSuffixes(viewsElement.textContent.trim()) : 0;
+
+		resultArray.push({
+			id: videoId,
+			videoUrl: videoUrl,
+			title: title,
+			thumbnailUrl: thumbnailUrl,
+			duration: duration,
+			authorInfo: authorInfo,
+			views: views,
+		});
+
+	});
+
+	return {
+		hasNextPage: hasNextPage,
+		videos: resultArray
+	};
+}
+
+function getVideoPager(path, params, page) {
+	log(`getVideoPager page=${page}`, params)
+	params = { ... params, page }
+
+	const url = URL_BASE + path;
+	const urlWithParams = `${url}${buildQuery(params)}`;
+
+	var html = httpGET(urlWithParams, {});
+
+	// Use different container IDs based on the path
+	// Search pages use "videoSearchResult", home/category pages use "videoCategory"
+	var containerId = path.includes("/search") ? "videoSearchResult" : "videoCategory";
+	var vids = getVideos(html, containerId);
+	
+	return new PornhubVideoPager(vids.videos.map(v => {
+		return new PlatformVideo({
+			id: new PlatformID(PLATFORM, v.id, config.id),
+			name: v.title ?? "",
+			thumbnails: new Thumbnails([new Thumbnail(v.thumbnailUrl, 0)]),
+			author: new PlatformAuthorLink(new PlatformID(PLATFORM, v.authorInfo.authorName, config.id),
+				v.authorInfo.authorName,
+				v.authorInfo.channel),
+			datetime: undefined,
+			duration: v.duration,
+			viewCount: v.views,
+			url: v.videoUrl,
+			isLive: false
+		});
+
+	}), true, path, params, page);
+}
+
+
+function getVideos(html, ulId) {
+
+	let node = domParser.parseFromString(html, "text/html");
+	
+	// Find the ul element with id ulId
+	var ulElement = node.getElementById(ulId);
+
+	var total = 1;
+
+	var pagingIndicationElement = node.getElementsByClassName("showingCounter")[0];
+	if (pagingIndicationElement !== undefined && pagingIndicationElement !== null) {
+		var pagingIndication = pagingIndicationElement.textContent.trim();
+		if (pagingIndication && typeof pagingIndication === 'string') {
+			var indexOfTotalStr = pagingIndication.indexOf("of "); // "showing XX-ZZ of TOTAL"
+			if (indexOfTotalStr !== -1) {
+				total = parseInt(pagingIndication.substring(indexOfTotalStr + 3), 10);
+				log(`getVideos total: ${total}`);
+			}
+		}
+	}
+
+	var resultArray = []
+
+    if (ulElement) {
+        // Get all li elements inside the ul with class "pcVideoListItem" (new class)
+        const liElements = ulElement.querySelectorAll("li.pcVideoListItem");
+
+        log(`getVideos found ${liElements.length} li elements`);
+
+        // Iterate through each li element
+        liElements.forEach(function (li) {
+            // Get the data-video-id attribute of the li element for the videoId
+            const videoId = li.getAttribute("data-video-id");
+
+            // Ensure a valid videoId is found and it's not the ad element (which might have no data-video-id or a non-numeric id)
+            if (videoId && !isNaN(videoId)) {
+                // Find the first <a> tag inside the li which is the video link
+                const aElement = li.querySelector('a.js-linkVideoThumb');
+
+                if (aElement) {
+                    // Get the "href" attribute as "videoUrl"
+                    const videoUrl = URL_BASE + aElement.getAttribute('href');
+
+                    // Find the <img> tag inside the <a>
+                    const imgElement = aElement.querySelector('img');
+
+                    if (imgElement) {
+                        // Get the "src" attribute as "thumbnailUrl"
+                        const thumbnailUrl = imgElement.getAttribute('src');
+
+                        // Title can be from the img's alt or data-title, or the a tag's data-title, or the .thumbnailTitle span
+                        const title = imgElement.getAttribute("alt") || imgElement.getAttribute("data-title") || aElement.getAttribute("data-title");
+
+                        // Get the duration string from the <var> tag with class "duration"
+                        const durationVar = aElement.querySelector(".duration");
+                        const durationStr = durationVar ? durationVar.textContent.trim() : "0:00";
+                        const duration = parseDuration(durationStr);
+
+                        // Get the views string from the <var> tag inside the span with class "views"
+                        const viewsSpan = li.querySelector(".views var");
+                        const viewsStr = viewsSpan ? viewsSpan.textContent.trim() : "0";
+                        const views = parseNumberSuffix(viewsStr);
+
+                        // Get author information
+                        const authorLink = li.querySelector(".usernameWrap a");
+                        let authorInfo = {
+                            channel: "",
+                            authorName: ""
+                        };
+                        if (authorLink) {
+                            authorInfo.channel = URL_BASE + authorLink.getAttribute("href");
+                            authorInfo.authorName = authorLink.textContent.trim();
+                        }
+
+                        // Create an object with the desired properties and push it to the result array
+                        resultArray.push({
+                            id: videoId,
+                            videoUrl: videoUrl,
+                            title: title,
+                            thumbnailUrl: thumbnailUrl,
+                            duration: duration,
+                            authorInfo: authorInfo,
+                            views: views,
+                        });
+                    }
                 }
             }
-        }
-        return false;
+        });
     }
-    // object map
-    if (typeof cookies === "object") {
-        for (const k in cookies) {
-            if (!cookies[k]) continue;
-            for (let j = 0; j < AUTH_COOKIE_NAMES.length; j++) {
-                const n = AUTH_COOKIE_NAMES[j];
-                if (k === n || k.indexOf(n + ".") === 0) return true;
-            }
-        }
-        return false;
-    }
-    return false;
+
+	log(resultArray.length + " videos found");
+
+	return {
+		totalElemsPages: undefined,
+		videos: resultArray
+	};
+
+}
+
+
+/**
+ * HTTP GET wrapper that manages session lifecycle, bot detection bypass, and retries
+ * Similar to Kick's callUrl function but adapted for PornHub's specific challenges
+ * @param {string} url - The URL to fetch
+ * @param {Object} options - Request options
+ * @param {Object} options.headers - Optional custom headers to use instead of default headers
+ * @param {boolean} options.requireToken - Whether this request requires a valid session token (default: false)
+ * @param {boolean} options.parseJson - Whether to parse response as JSON (default: false)
+ * @param {number} options.retries - Number of retry attempts on failure (default: 3)
+ * @returns {string | Object} - Response body as string or parsed JSON
+ * @throws {ScriptException}
+ */
+function httpGET(url, options = {}) {
+	// Extract options with defaults
+	var customHeaders = options.headers || null;
+	var requireToken = options.requireToken || false;
+	var parseJson = options.parseJson || false;
+	var retries = options.retries !== undefined ? options.retries : 3;
+
+	let lastError = null;
+	let attempts = retries + 1; // +1 for the initial attempt
+
+	// Use custom headers if provided, otherwise use default headers
+	var requestHeaders = customHeaders || headers;
+
+	while (attempts > 0) {
+		try {
+			// Step 1: Ensure we have a valid session
+			if (headers["Cookie"].length === 0) {
+				log("Session empty, refreshing...");
+				refreshSession();
+				// Update request headers with new cookies if using default headers
+				if (!customHeaders) {
+					requestHeaders = headers;
+				} else {
+					// Update cookie in custom headers
+					customHeaders["Cookie"] = headers["Cookie"];
+					requestHeaders = customHeaders;
+				}
+			} else if (requireToken && state.token === "") {
+				log("Token required but empty, refreshing session...");
+				refreshSession();
+				// Update request headers after session refresh
+				if (!customHeaders) {
+					requestHeaders = headers;
+				} else {
+					customHeaders["Cookie"] = headers["Cookie"];
+					requestHeaders = customHeaders;
+				}
+			}
+
+			// Step 2: Make the HTTP request
+			log("httpGET: Fetching " + url + " (attempt " + (retries - attempts + 2) + "/" + (retries + 1) + ")");
+			// Pass useAuth=true so Grayjay's captured login cookies (il, phn, ...)
+			// are attached -- without this every logged-in URL returns 404 / login-redirect.
+			const resp = http.GET(url, requestHeaders, true);
+
+			// Step 3: Check response status
+			if (!resp.isOk) {
+				throw new ScriptException("Request [" + url + "] failed with code [" + resp.code + "]");
+			}
+
+			var body = resp.body;
+
+			// Step 4: Check for bot detection challenge
+			if (isBotChallenge(body)) {
+				log("Bot challenge detected on attempt " + (retries - attempts + 2));
+
+				// Solve the challenge
+				var keyCookieValue = solveBotChallenge(body);
+
+				if (!keyCookieValue) {
+					throw new ScriptException("Failed to solve bot challenge");
+				}
+
+				// Update headers with KEY cookie
+				headers["Cookie"] += "; KEY=" + keyCookieValue;
+
+				// Update request headers
+				if (!customHeaders) {
+					requestHeaders = headers;
+				} else {
+					customHeaders["Cookie"] = headers["Cookie"];
+					requestHeaders = customHeaders;
+				}
+
+				log("KEY cookie added, retrying request...");
+
+				// Retry the request with the KEY cookie
+				const retryResp = http.GET(url, requestHeaders, true);
+
+				if (!retryResp.isOk) {
+					throw new ScriptException("Retry request [" + url + "] failed with code [" + retryResp.code + "]");
+				}
+
+				body = retryResp.body;
+
+				// Verify challenge was bypassed
+				if (isBotChallenge(body)) {
+					throw new ScriptException("Bot challenge persists after solving");
+				}
+
+				log("Bot challenge bypassed successfully");
+			}
+
+			// Step 5: Parse response if requested
+			if (parseJson) {
+				try {
+					var json = JSON.parse(body);
+
+					// Check for API errors
+					if (json.error) {
+						throw new ScriptException("API error: " + json.error);
+					}
+
+					return json;
+				} catch (parseError) {
+					log("Failed to parse JSON: " + parseError);
+					throw new ScriptException("JSON parse error: " + parseError);
+				}
+			}
+
+			// Step 6: Return successful response
+			return body;
+
+		} catch (error) {
+			lastError = error;
+			attempts--;
+
+			log("Request failed: " + error + " (attempts remaining: " + attempts + ")");
+
+			// If we have more attempts and the error is recoverable, try refreshing session
+			if (attempts > 0) {
+				if (error.toString().includes("401") || error.toString().includes("403") ||
+				    error.toString().includes("session") || error.toString().includes("token")) {
+					log("Attempting session refresh before retry...");
+					try {
+						refreshSession();
+						// Update request headers after refresh
+						if (!customHeaders) {
+							requestHeaders = headers;
+						} else {
+							customHeaders["Cookie"] = headers["Cookie"];
+							requestHeaders = customHeaders;
+						}
+					} catch (refreshError) {
+						log("Session refresh failed: " + refreshError);
+					}
+				}
+
+				// Small delay before retry to avoid rate limiting
+				log("Waiting 1 second before retry...");
+				bridge.sleep(1000);
+				continue;
+			}
+
+			// All retry attempts exhausted
+			log("Request failed after " + (retries + 1) + " attempts");
+			throw lastError;
+		}
+	}
+
+	// Should never reach here, but just in case
+	throw lastError || new ScriptException("Request failed for unknown reason");
+}
+
+function parseNumberSuffix(numStr) {
+
+	var mul = 1;
+	if (numStr.includes("K")) {
+		mul = 1000;
+	}
+	if (numStr.includes("M")) {
+		mul = 1000000;
+	}
+
+	var out = parseFloat(numStr.slice(0, -1)) * mul;
+	return out;
+}
+
+function parseDuration(durationStr) {
+	if (!durationStr) return 0;
+	var splitted = String(durationStr).trim().split(":");
+	if (splitted.length === 2) {
+		var mins = parseInt(splitted[0]) || 0;
+		var secs = parseInt(splitted[1]) || 0;
+		return 60 * mins + secs;
+	}
+	if (splitted.length === 3) {
+		var hrs = parseInt(splitted[0]) || 0;
+		var mns = parseInt(splitted[1]) || 0;
+		var scs = parseInt(splitted[2]) || 0;
+		return 3600 * hrs + 60 * mns + scs;
+	}
+	return parseInt(durationStr) || 0;
+}
+
+// ====================================================================
+// Authentication (login / logout / session detection)
+// ====================================================================
+
+function hasValidAuthCookie(cookies) {
+	if (!cookies) return false;
+	if (typeof cookies === "string") {
+		if (!cookies.length) return false;
+		for (var i = 0; i < AUTH_COOKIE_NAMES.length; i++) {
+			if (cookies.indexOf(AUTH_COOKIE_NAMES[i] + "=") >= 0) return true;
+		}
+		return false;
+	}
+	if (Array.isArray(cookies)) {
+		for (var j = 0; j < cookies.length; j++) {
+			var c = cookies[j];
+			if (c && c.name && AUTH_COOKIE_NAMES.indexOf(c.name) >= 0) return true;
+		}
+		return false;
+	}
+	if (typeof cookies === "object") {
+		for (var k in cookies) {
+			if (cookies[k] && AUTH_COOKIE_NAMES.indexOf(k) >= 0) return true;
+		}
+		return false;
+	}
+	return false;
 }
 
 function cookiesToString(cookies) {
-    if (!cookies) return "";
-    if (typeof cookies === "string") return cookies;
-    if (Array.isArray(cookies)) {
-        return cookies.filter(c => c && c.name && c.value)
-            .map(c => c.name + "=" + c.value).join("; ");
-    }
-    if (typeof cookies === "object") {
-        const out = [];
-        for (const k in cookies) { if (cookies[k]) out.push(k + "=" + cookies[k]); }
-        return out.join("; ");
-    }
-    return "";
+	if (!cookies) return "";
+	if (typeof cookies === "string") return cookies;
+	if (Array.isArray(cookies)) {
+		return cookies.filter(c => c && c.name && c.value)
+			.map(c => c.name + "=" + c.value).join("; ");
+	}
+	if (typeof cookies === "object") {
+		var out = [];
+		for (var k in cookies) { if (cookies[k]) out.push(k + "=" + cookies[k]); }
+		return out.join("; ");
+	}
+	return "";
 }
 
-// Read whatever cookies Grayjay captured for pmvhaven.com after the login web
-// view. Mirrors SB-GJ: try http.getCookies first, then the bridge variants.
+// Loads whatever cookies Grayjay captured for pornhub.com after the login
+// flow, and merges any auth cookies into the shared `headers["Cookie"]` so
+// subsequent http.GET calls (which use those headers) are authenticated.
 function loadAuthCookies() {
-    try {
-        if (typeof http.getCookies === "function") {
-            const cookies = http.getCookies(BASE_URL);
-            if (hasValidAuthCookie(cookies)) { state.authCookies = cookiesToString(cookies); return true; }
-        }
-        if (typeof bridge !== "undefined" && bridge) {
-            if (typeof bridge.getCookieString === "function") {
-                const s = bridge.getCookieString(BASE_URL);
-                if (hasValidAuthCookie(s)) { state.authCookies = s; return true; }
-            }
-            if (typeof bridge.getCookies === "function") {
-                try {
-                    const c = bridge.getCookies("pmvhaven.com");
-                    if (hasValidAuthCookie(c)) { state.authCookies = cookiesToString(c); return true; }
-                } catch (e) { /* ignore */ }
-            }
-        }
-    } catch (e) { log("loadAuthCookies error: " + e); }
-    return false;
+	var captured = "";
+	try {
+		if (typeof http.getCookies === "function") {
+			var ck = http.getCookies(URL_BASE);
+			if (hasValidAuthCookie(ck)) captured = cookiesToString(ck);
+		}
+		if (!captured && typeof bridge !== "undefined" && bridge) {
+			if (typeof bridge.getCookieString === "function") {
+				var s = bridge.getCookieString(URL_BASE);
+				if (hasValidAuthCookie(s)) captured = s;
+			}
+			if (!captured && typeof bridge.getCookies === "function") {
+				try {
+					var c2 = bridge.getCookies("pornhub.com");
+					if (hasValidAuthCookie(c2)) captured = cookiesToString(c2);
+				} catch (e) { /* ignore */ }
+			}
+		}
+	} catch (e) { log("loadAuthCookies error: " + e); }
+	if (captured) {
+		// Merge captured auth cookies into the default request headers cookie
+		// string. We keep the existing platform=pc / accessAgeDisclaimerPH=2
+		// cookies (needed by many endpoints) and append anything new.
+		try {
+			var existing = headers["Cookie"] || "";
+			var existingNames = {};
+			existing.split(";").forEach(function(p) {
+				var kv = p.trim().split("=");
+				if (kv[0]) existingNames[kv[0]] = true;
+			});
+			captured.split(";").forEach(function(p) {
+				var part = p.trim();
+				if (!part) return;
+				var name = part.split("=")[0];
+				if (!existingNames[name]) {
+					existing += (existing ? "; " : "") + part;
+					existingNames[name] = true;
+				}
+			});
+			headers["Cookie"] = existing;
+		} catch (e) { log("loadAuthCookies merge error: " + e); }
+		return true;
+	}
+	return false;
 }
 
-function tryParseSession(res) {
-    if (!res || !res.isOk) return false;
-    const body = (res.body || "").trim();
-    if (!body || body === "null") return false;
-    try {
-        const json = JSON.parse(body);
-        const user = json.user || (json.session && json.session.user) || json.data;
-        if (!user) return false;
-        // PMVHaven's API uses `customUserId` (24-char hex) for /api/users/...
-        // endpoints (subscriptions, playlists?owner=...). The better-auth
-        // `id` field is a separate internal id that those endpoints reject.
-        // Prefer customUserId; fall back to other variants only if missing.
-        const uid = user.customUserId || user._id || user.userId || user.id;
-        if (!uid) return false;
-        state.userId = uid;
-        state.username = user.username || user.name || state.username || "";
-        return true;
-    } catch (e) { /* ignore */ }
-    return false;
+// Parse the URL-safe user path (like "9fa60b0") AND the display name from
+// the logged-in HTML. Pornhub exposes the current user at:
+//   <a href="/users/<userPath>/account">     -- profile dropdown
+//   <a href="/users/<userPath>/playlists">   -- header link
+//   <meta name="USR" content="<displayName>">
+// The userPath is what's used in all /users/<X>/... paths.
+function parseUserPathFromHtml(html) {
+	if (!html) return "";
+	var patterns = [
+		/href=["']\/users\/([a-zA-Z0-9_.-]{3,40})\/account\b/i,
+		/href=["']\/users\/([a-zA-Z0-9_.-]{3,40})\/playlists\b/i,
+		/href=["']\/users\/([a-zA-Z0-9_.-]{3,40})\/subscriptions\b/i,
+		/href=["']\/users\/([a-zA-Z0-9_.-]{3,40})\/pornstar_subscriptions\b/i,
+		/href=["']\/users\/([a-zA-Z0-9_.-]{3,40})\/channel_subscriptions\b/i,
+		/href=["']\/users\/([a-zA-Z0-9_.-]{3,40})\/videos\/favorites\b/i,
+		/href=["']\/users\/([a-zA-Z0-9_.-]{3,40})\/videos\/recent\b/i,
+		// Header dropdown: usernameLink / userMenu wrapping anchor
+		/<a[^>]+class=["'][^"']*usernameLink[^"']*["'][^>]+href=["']\/users\/([a-zA-Z0-9_.-]{3,40})/i,
+		/id=["']profileMenuDropdown["'][^>]*>[\s\S]{0,200}?href=["']\/users\/([a-zA-Z0-9_.-]{3,40})/i
+	];
+	for (var i = 0; i < patterns.length; i++) {
+		var m = html.match(patterns[i]);
+		if (m && m[1]) return m[1];
+	}
+	return "";
 }
 
-function fetchUserInfo() {
-    // Pull username/userId from /api/auth/get-session using current cookies.
-    // Tries Grayjay's auth context first (useAuth=true), then falls back to
-    // sending the captured cookies as an explicit Cookie header. The fallback
-    // is what lets us recognise the login when the user signed in via the
-    // generic "video -> more -> page" web view, instead of the dedicated
-    // Authentication login flow (cookies are still in Grayjay's cookie jar
-    // but may not be flagged as plugin-auth).
-    try {
-        const res1 = http.GET(BASE_URL + "/api/auth/get-session", API_HEADERS, true);
-        if (tryParseSession(res1)) return true;
-    } catch (e) { log("fetchUserInfo(useAuth) error: " + e); }
-
-    try {
-        if (state.authCookies && state.authCookies.length > 0) {
-            const hdrs = Object.assign({}, API_HEADERS, { "Cookie": state.authCookies });
-            const res2 = http.GET(BASE_URL + "/api/auth/get-session", hdrs, false);
-            if (tryParseSession(res2)) return true;
-        }
-    } catch (e) { log("fetchUserInfo(manual cookie) error: " + e); }
-
-    return false;
+function parseUsernameFromHtml(html) {
+	try {
+		var dom = domParser.parseFromString(html);
+		var meta = dom.querySelector("meta[name='USR']") || dom.querySelector("meta[name='userId']");
+		if (meta && meta.getAttribute("content")) {
+			var v = meta.getAttribute("content").trim();
+			if (v && v.toLowerCase() !== "guest" && v !== "0") {
+				return v;
+			}
+		}
+		var a = dom.querySelector("a.username, a#headerUsername, li#headerUsername a");
+		if (a) {
+			var name = a.textContent.trim();
+			if (name && name.toLowerCase() !== "log in" && name.toLowerCase() !== "sign in") {
+				return name;
+			}
+		}
+	} catch (e) { /* ignore */ }
+	return "";
 }
 
-// Authoritative server-side check: ask /api/auth/get-session with the captured
-// cookies. Returns true and populates username/userId when a session exists.
+// Authoritative session probe: fetch a logged-in page and extract BOTH the
+// display name (state.username) and the URL-safe user path (state.userPath).
+// state.userPath is what's used in /users/<X>/... URLs.
 function validateSession() {
-    return fetchUserInfo();
+	try {
+		// /account redirects to /users/<userPath>/account when logged in, so
+		// the redirected URL itself encodes the answer. Try it first.
+		try {
+			var r0 = http.GET(URL_BASE + "/account", headers, true);
+			if (r0 && r0.url) {
+				var rm = r0.url.match(/\/users\/([a-zA-Z0-9_.-]{3,40})\b/);
+				if (rm && rm[1]) {
+					state.userPath = rm[1];
+					log("validateSession via /account redirect -> userPath=" + state.userPath);
+				}
+			}
+			if (r0 && r0.isOk) {
+				var body0 = r0.body || "";
+				if (!state.userPath) {
+					var p0 = parseUserPathFromHtml(body0);
+					if (p0) state.userPath = p0;
+				}
+				var u0 = parseUsernameFromHtml(body0);
+				if (u0) state.username = u0;
+			}
+		} catch (e0) { /* fall through */ }
+
+		if (state.userPath && state.username) return true;
+
+		var paths = ["/", "/front_page"];
+		for (var i = 0; i < paths.length; i++) {
+			var resp;
+			try { resp = http.GET(URL_BASE + paths[i], headers, true); } catch (e) { continue; }
+			if (!resp || !resp.isOk) continue;
+			var body = resp.body || "";
+			if (!state.userPath) {
+				var p = parseUserPathFromHtml(body);
+				if (p) state.userPath = p;
+			}
+			if (!state.username) {
+				var u = parseUsernameFromHtml(body);
+				if (u) state.username = u;
+			}
+			if (state.userPath && state.username) break;
+		}
+		log("validateSession: userPath=" + state.userPath + " username=" + state.username);
+		return !!(state.userPath || state.username);
+	} catch (e) { log("validateSession error: " + e); }
+	return false;
 }
 
 function bridgeIsLoggedIn() {
-    try {
-        if (typeof bridge !== "undefined" && bridge && typeof bridge.isLoggedIn === "function") {
-            return !!bridge.isLoggedIn();
-        }
-    } catch (e) { /* ignore */ }
-    return false;
+	try {
+		if (typeof bridge !== "undefined" && bridge && typeof bridge.isLoggedIn === "function") {
+			return !!bridge.isLoggedIn();
+		}
+	} catch (e) { /* ignore */ }
+	return false;
 }
 
-source.isLoggedIn = function() {
-    try {
-        // 1) Trust Grayjay's bridge signal first — once it has captured the
-        //    required cookies via its login web view, this is the authoritative
-        //    indicator that the user finished the flow.
-        if (bridgeIsLoggedIn()) {
-            loadAuthCookies();
-            state.isAuthenticated = true;
-            if (!state.username) fetchUserInfo();
-            return true;
-        }
-        // 2) Make sure we have whatever auth cookies were captured, then ask
-        //    the server with them. This is how the session is recognised after
-        //    the user finishes logging in inside the web view.
-        loadAuthCookies();
-        if (validateSession()) {
-            state.isAuthenticated = true;
-            return true;
-        }
-        state.isAuthenticated = false;
-        return false;
-    } catch (e) {
-        log("isLoggedIn error: " + e);
-        return false;
-    }
+source.isLoggedIn = function () {
+	try {
+		if (bridgeIsLoggedIn()) {
+			loadAuthCookies();
+			state.isAuthenticated = true;
+			if (!state.userPath || !state.username) validateSession();
+			return true;
+		}
+		loadAuthCookies();
+		if (validateSession()) {
+			state.isAuthenticated = true;
+			return true;
+		}
+		state.isAuthenticated = false;
+		return false;
+	} catch (e) {
+		log("isLoggedIn error: " + e);
+		return false;
+	}
 };
 
-source.getLoggedInUser = function() {
-    try {
-        if (!source.isLoggedIn()) return null;
-        if (!state.username) fetchUserInfo();
-        return state.username || "Logged In";
-    } catch (e) { return null; }
+source.getLoggedInUser = function () {
+	try {
+		if (!source.isLoggedIn()) return null;
+		if (!state.username) validateSession();
+		return state.username || state.userPath || "Logged In";
+	} catch (e) { return null; }
 };
 
-// IMPORTANT: Grayjay shows "Login cancelled" whenever this returns false (or
-// throws). SB-GJ never returns false here — it trusts that Grayjay's web view
-// captured the cookies and returns true unconditionally. We do the same:
-// the actual session check is deferred to isLoggedIn()/getLoggedInUser() so
-// the user can re-validate later from settings without aborting the flow.
-source.login = function() {
-    try {
-        loadAuthCookies();
-        state.isAuthenticated = true;
-        // Best-effort: try to populate the username right away.
-        try { fetchUserInfo(); } catch (e) { /* ignore */ }
-        log("login(): accepted - cookies captured by Grayjay");
-        return true;
-    } catch (e) {
-        log("login error: " + e);
-        // Still return true so Grayjay does not display "Login cancelled".
-        // isLoggedIn() will resolve the real state on the next call.
-        return true;
-    }
+// Mirrors HV-GJ: return true unconditionally so Grayjay never displays
+// "Login cancelled". isLoggedIn() will resolve the real state on next call.
+source.login = function () {
+	try {
+		loadAuthCookies();
+		state.isAuthenticated = true;
+		try { validateSession(); } catch (e) { /* ignore */ }
+		log("login(): accepted - cookies captured by Grayjay");
+		return true;
+	} catch (e) {
+		log("login error: " + e);
+		return true;
+	}
 };
 
-// Called by Grayjay just before opening the login web view. Mirroring SB-GJ:
-// wipe any stale auth state and clear residual cookies so the user always
-// starts the login flow fresh (avoids stuck/expired session cookies blocking
-// the cookiesToFind trigger from firing).
-source.prepareLogin = function() {
-    try {
-        state.isAuthenticated = false;
-        state.username = "";
-        state.userId = "";
-        state.authCookies = "";
-        try {
-            if (typeof http.clearCookies === "function") {
-                http.clearCookies("pmvhaven.com");
-                http.clearCookies("www.pmvhaven.com");
-            }
-            if (typeof bridge !== "undefined" && bridge && bridge.clearCookies) {
-                bridge.clearCookies("pmvhaven.com");
-                bridge.clearCookies("www.pmvhaven.com");
-            }
-        } catch (e) { /* ignore */ }
-        log("prepareLogin: cleared stale auth state");
-        return true;
-    } catch (e) {
-        log("prepareLogin error: " + e);
-        return true;
-    }
+source.prepareLogin = function () {
+	try {
+		state.isAuthenticated = false;
+		state.username = "";
+		state.userId = "";
+		state.userPath = "";
+		// Reset cookie string to the public defaults so the next login is fresh.
+		headers["Cookie"] = "platform=pc; accessAgeDisclaimerPH=2";
+		try {
+			if (typeof http.clearCookies === "function") {
+				http.clearCookies("pornhub.com");
+				http.clearCookies("www.pornhub.com");
+			}
+			if (typeof bridge !== "undefined" && bridge && bridge.clearCookies) {
+				bridge.clearCookies("pornhub.com");
+				bridge.clearCookies("www.pornhub.com");
+			}
+		} catch (e) { /* ignore */ }
+		return true;
+	} catch (e) {
+		log("prepareLogin error: " + e);
+		return true;
+	}
 };
 
-source.logout = function() {
-    state.isAuthenticated = false;
-    state.username = "";
-    state.userId = "";
-    state.authCookies = "";
-    try {
-        if (typeof http.clearCookies === "function") {
-            http.clearCookies("pmvhaven.com");
-            http.clearCookies("www.pmvhaven.com");
-        }
-        if (typeof bridge !== "undefined" && bridge && bridge.clearCookies) {
-            bridge.clearCookies("pmvhaven.com");
-            bridge.clearCookies("www.pmvhaven.com");
-        }
-    } catch (e) { /* ignore */ }
+source.logout = function () {
+	state.isAuthenticated = false;
+	state.username = "";
+	state.userId = "";
+	state.userPath = "";
+	headers["Cookie"] = "platform=pc; accessAgeDisclaimerPH=2";
+	try {
+		if (typeof http.clearCookies === "function") {
+			http.clearCookies("pornhub.com");
+			http.clearCookies("www.pornhub.com");
+		}
+		if (typeof bridge !== "undefined" && bridge && bridge.clearCookies) {
+			bridge.clearCookies("pornhub.com");
+			bridge.clearCookies("www.pornhub.com");
+		}
+	} catch (e) { /* ignore */ }
 };
 
-// ---------- home ----------
+// ====================================================================
+// Playlist search & details
+// ====================================================================
 
-source.getHome = function() {
-    // The /api/videos/trending endpoint is NOT paginated: it returns the same
-    // fixed set on every page, which made Grayjay's home feed repeat forever.
-    // Use the browse endpoint (/api/videos) which paginates correctly.
-    return new VideosApiPager("browse", { sort: "-uploadDate" });
+source.isPlaylistUrl = function (url) {
+	if (!url) return false;
+	if (isVirtualPlaylistUrl(url)) return true;
+	if (/\/playlist\/watchlater\b/.test(url)) return true;
+	if (/\/likedvideos\b/.test(url)) return true;
+	if (/\/subscriptions\b/.test(url) && !/\/users\//.test(url)) return true;
+	return /^https?:\/\/(?:[a-z]{2}\.)?(?:www\.)?pornhub\.com\/playlist\/\d+/.test(url);
 };
 
-// ---------- search ----------
-
-source.searchSuggestions = function(query) { return []; };
-
-// Search filter constants (must match values used in search())
-const SORT_OPTIONS = ["Relevance", "Newest", "Oldest", "Most Viewed", "Most Liked", "Top Rated"];
-const SORT_MAP = {
-    "Relevance":    "",
-    "Newest":       "-uploadDate",
-    "Oldest":       "uploadDate",
-    "Most Viewed":  "-views",
-    "Most Liked":   "-likes",
-    "Top Rated":    "-bayesianRating"
-};
-const DATE_DAYS = { "today": 1, "7days": 7, "30days": 30, "365days": 365 };
-const DURATION_MAP = {
-    "0-5":   { durationMax: 5 * 60 },
-    "5-20":  { durationMin: 5 * 60, durationMax: 20 * 60 },
-    "20+":   { durationMin: 20 * 60 }
-};
-// Quality buckets via video height. These params are honoured ONLY by the
-// browse endpoint (/api/videos), so search() routes to browse when set.
-const QUALITY_MAP = {
-    "2160": { minHeight: 2160 },
-    "1440": { minHeight: 1440, maxHeight: 2159 },
-    "1080": { minHeight: 1080, maxHeight: 1439 },
-    "720":  { minHeight: 720,  maxHeight: 1079 }
-};
-// Popular PMVHaven tags used to build the "Category" filter (multi-select).
-const CATEGORY_FILTERS = [
-    { name: "Any",            value: "" },
-    { name: "Amateur",        value: "amateur" },
-    { name: "Anal",           value: "anal" },
-    { name: "Asian",          value: "asian" },
-    { name: "Big Ass",        value: "big ass" },
-    { name: "Big Tits",       value: "big tits" },
-    { name: "Blonde",         value: "blonde" },
-    { name: "Blowjob",        value: "blowjob" },
-    { name: "Brunette",       value: "brunette" },
-    { name: "Cosplay",        value: "cosplay" },
-    { name: "Cowgirl",        value: "cowgirl" },
-    { name: "Creampie",       value: "creampie" },
-    { name: "Cum",            value: "cum" },
-    { name: "Cumshot",        value: "cumshot" },
-    { name: "Cute",           value: "cute" },
-    { name: "Dancing",        value: "dancing" },
-    { name: "Deepthroat",     value: "deepthroat" },
-    { name: "Doggystyle",     value: "doggystyle" },
-    { name: "Facial",         value: "facial" },
-    { name: "Gangbang",       value: "gangbang" },
-    { name: "Goon",           value: "goon" },
-    { name: "Hardcore",       value: "hardcore" },
-    { name: "Hentai",         value: "hentai" },
-    { name: "HMV",            value: "hmv" },
-    { name: "Hypno",          value: "hypno" },
-    { name: "Interracial",    value: "interracial" },
-    { name: "Japanese",       value: "japanese" },
-    { name: "JAV",            value: "jav" },
-    { name: "MILF",           value: "milf" },
-    { name: "POV",            value: "pov" },
-    { name: "PAWG",           value: "pawg" },
-    { name: "Riding",         value: "riding" },
-    { name: "Sissy",          value: "sissy" },
-    { name: "Splitscreen",    value: "splitscreen" },
-    { name: "Teasing",        value: "teasing" },
-    { name: "Teen",           value: "teen" },
-    { name: "TikTok",         value: "tiktok" },
-    { name: "Twerking",       value: "twerking" },
-    { name: "3D",             value: "3d" }
-];
-
-source.getSearchCapabilities = function() {
-    return {
-        // Only video feed types here. Including Channels/Playlists in the
-        // search types makes Grayjay hide the filter/sort UI (official plugins
-        // like PeerTube/Rumble only declare video types alongside filters).
-        types: [Type.Feed.Mixed, Type.Feed.Videos],
-        sorts: SORT_OPTIONS,
-        filters: [
-            {
-                id: "date",
-                name: "Date",
-                isMultiSelect: false,
-                filters: [
-                    { name: "Any time",     value: "" },
-                    { name: "Today",        value: "today" },
-                    { name: "Last 7 days",  value: "7days" },
-                    { name: "Last 30 days", value: "30days" },
-                    { name: "Last year",    value: "365days" }
-                ]
-            },
-            {
-                id: "duration",
-                name: "Duration",
-                isMultiSelect: false,
-                filters: [
-                    { name: "Any",       value: "" },
-                    { name: "0-5 min",   value: "0-5" },
-                    { name: "5-20 min",  value: "5-20" },
-                    { name: "20+ min",   value: "20+" }
-                ]
-            },
-            {
-                id: "quality",
-                name: "Quality",
-                isMultiSelect: false,
-                filters: [
-                    { name: "Any",        value: "" },
-                    { name: "2160p (4K)", value: "2160" },
-                    { name: "1440p",      value: "1440" },
-                    { name: "1080p",      value: "1080" },
-                    { name: "720p",       value: "720" }
-                ]
-            },
-            {
-                id: "category",
-                name: "Category",
-                isMultiSelect: false,
-                filters: CATEGORY_FILTERS
-            }
-        ]
-    };
+source.searchPlaylists = function (query) {
+	return new PornhubPlaylistsPager(query, 1);
 };
 
-function buildSearchFilterParams(order, filters) {
-    const out = {};
-    if (order && SORT_MAP[order] !== undefined && SORT_MAP[order] !== "") {
-        out.sort = SORT_MAP[order];
-    }
-    if (filters && typeof filters === "object") {
-        const date = pickFilter(filters, "date");
-        if (date && DATE_DAYS[date]) {
-            const from = new Date(Date.now() - DATE_DAYS[date] * 24 * 3600 * 1000);
-            out.uploadDateFrom = from.toISOString();
-        }
-        const dur = pickFilter(filters, "duration");
-        if (dur && DURATION_MAP[dur]) Object.assign(out, DURATION_MAP[dur]);
-        const q = pickFilter(filters, "quality");
-        if (q && QUALITY_MAP[q]) Object.assign(out, QUALITY_MAP[q]);
-        const tags = pickFilterAll(filters, "category").filter(t => t && t.length > 0);
-        if (tags.length) out.tags = tags.join(",");
-    }
-    return out;
+function _extractPlaylistIdFromUrl(url) {
+	if (!url) return null;
+	var m = url.match(/\/playlist\/(\d+)/);
+	return m ? m[1] : null;
 }
 
-function pickFilter(filters, id) {
-    if (!filters) return null;
-    const v = filters[id];
-    if (Array.isArray(v)) return v.length ? v[0] : null;
-    return v || null;
+function _playlistUrlFromId(id) {
+	return URL_BASE + "/playlist/" + id;
 }
 
-function pickFilterAll(filters, id) {
-    if (!filters) return [];
-    const v = filters[id];
-    if (Array.isArray(v)) return v.slice();
-    return v ? [v] : [];
+function _parsePlaylistListItems(html) {
+	// Parses a search-result / "all playlists" page. Pornhub varies the
+	// tile container class quite a bit between `/playlist/search`, the
+	// `/users/<id>/playlists` page and the home-page recommended row, so we
+	// try a broad selector and then fall back to an anchor-only scan that
+	// guarantees nothing is missed.
+	var dom = domParser.parseFromString(html);
+	var out = [];
+	var seen = {};
+	var nodes = dom.querySelectorAll("li.pcVideoListItem, li.playlistLink, ul.user-playlist li, li.playlistsItem, li[data-playlist-id], li.videoBlock, li.videoblock, div.playlist");
+	for (var i = 0; i < nodes.length; i++) {
+		var li = nodes[i];
+		var id = li.getAttribute("data-id") || li.getAttribute("data-playlist-id");
+		var titleA = li.querySelector("a.title, span.title a, a.linkPlaylist, a.playlistTitle, a[href*='/playlist/']");
+		var href = titleA ? titleA.getAttribute("href") : "";
+		if (!id && href) {
+			var mm = href.match(/\/playlist\/(\d+)/);
+			if (mm) id = mm[1];
+		}
+		if (!id) continue;
+		if (seen[id]) continue;
+		seen[id] = true;
+		var name = titleA ? titleA.textContent.trim() : "";
+		if (!name) {
+			var alt = li.querySelector("img");
+			name = alt ? (alt.getAttribute("alt") || "") : "";
+		}
+		var img = li.querySelector("img");
+		var thumb = img ? (img.getAttribute("data-thumb_url") || img.getAttribute("data-src") || img.getAttribute("src") || "") : "";
+		var ownerA = li.querySelector(".usernameWrap a, a.usernameLink, a[href*='/users/'], a[href*='/model/'], a[href*='/pornstar/'], a[href*='/channels/']");
+		var ownerName = ownerA ? ownerA.textContent.trim() : "";
+		var ownerUrl = ownerA ? (URL_BASE + ownerA.getAttribute("href")) : "";
+		var countEl = li.querySelector(".videoCount, .videos, .videosNumber");
+		var videoCount = 0;
+		if (countEl) {
+			var n = parseInt((countEl.textContent || "").replace(/[^0-9]/g, ""));
+			if (!isNaN(n)) videoCount = n;
+		}
+		out.push({
+			id: id,
+			name: name || ("Playlist " + id),
+			thumbnail: thumb,
+			ownerName: ownerName,
+			ownerUrl: ownerUrl,
+			videoCount: videoCount
+		});
+	}
+	if (!out.length) {
+		// Fallback -- scan every anchor referencing a playlist id.
+		var anchors = dom.querySelectorAll("a[href*='/playlist/']");
+		for (var k = 0; k < anchors.length; k++) {
+			var hh = anchors[k].getAttribute("href") || "";
+			var pm = hh.match(/\/playlist\/(\d+)/);
+			if (!pm) continue;
+			if (seen[pm[1]]) continue;
+			seen[pm[1]] = true;
+			var ttxt = anchors[k].textContent.trim();
+			var img2 = anchors[k].querySelector("img");
+			var thumb2 = img2 ? (img2.getAttribute("data-thumb_url") || img2.getAttribute("data-src") || img2.getAttribute("src") || "") : "";
+			out.push({
+				id: pm[1],
+				name: ttxt || ("Playlist " + pm[1]),
+				thumbnail: thumb2,
+				ownerName: "",
+				ownerUrl: "",
+				videoCount: 0
+			});
+		}
+	}
+	return out;
 }
 
-source.search = function(query, type, order, filters) {
-    // Pasting a pmvhaven.com link into search resolves it to the exact item
-    // (playlist, profile or video) instead of a fuzzy text match.
-    const direct = trySearchDirectUrl(query);
-    if (direct) return direct;
-    if (type === Type.Feed.Channels) return source.searchChannels(query);
-    if (type === Type.Feed.Playlists) return source.searchPlaylists(query);
-    const extra = buildSearchFilterParams(order, filters);
-    // The text-search endpoint (/api/videos/search) ignores minHeight/maxHeight,
-    // so when a Quality filter is active we use the browse endpoint
-    // (/api/videos) which honours every filter. Browse has no free-text param,
-    // so the typed query is folded into the tag list (matches pmvhaven.com's
-    // own tag-based /search page).
-    if (extra.minHeight || extra.maxHeight) {
-        const tagList = [];
-        if (extra.tags) tagList.push(extra.tags);
-        if (query && query.trim()) tagList.push(query.trim().toLowerCase());
-        if (tagList.length) extra.tags = tagList.join(",");
-        return new VideosApiPager("browse", extra);
-    }
-    return new VideosApiPager("search", Object.assign({ q: query }, extra));
-};
-
-source.searchChannels = function(query) {
-    try {
-        const data = jsonGETNoThrow(BASE_URL + "/api/users/search" + buildQuery({ q: query }));
-        const users = (data && data.users) || [];
-        const channels = users.map(u => new PlatformChannel({
-            id: new PlatformID(PLATFORM, u.username, config.id, PLATFORM_CLAIMTYPE),
-            name: u.displayName || u.username,
-            thumbnail: u.avatarUrl || "",
-            banner: "",
-            subscribers: 0,
-            description: "",
-            url: channelUrlFromUsername(u.username),
-            links: {}
-        }));
-        return new ChannelPager(channels, false);
-    } catch (e) {
-        log("searchChannels error: " + e);
-        return new ChannelPager([], false);
-    }
-};
-
-source.searchPlaylists = function(query) {
-    return new PlaylistsApiPager(query);
-};
-
-// When the search box contains a pmvhaven.com URL, return the exact entity it
-// points at as a single-result feed. Handles playlist, profile and video links
-// (with or without the leading https://). Returns null for normal text queries.
-function normalizePmvUrl(q) {
-    q = (q || "").trim();
-    if (/^https?:\/\//i.test(q)) return q;
-    const i = q.toLowerCase().indexOf("pmvhaven.com");
-    if (i < 0) return q;
-    return "https://" + q.slice(i);
+function _parsePlaylistVideos(html) {
+	// Pornhub renders the same video tile in many places but with slightly
+	// different `li`/`div` classes. Try the broadest selector first, then
+	// fall back to anything that looks like a video block (has data-video-id
+	// or an anchor pointing at view_video.php?viewkey=).
+	var dom = domParser.parseFromString(html);
+	var out = [];
+	var seen = {};
+	var lis = dom.querySelectorAll("li.pcVideoListItem, li.videoBlock, li.videoblock, li[data-video-id], div.videoBlock[data-video-id]");
+	if (!lis || !lis.length) {
+		// Last resort: anchor scan -- find every viewkey on the page and
+		// rebuild minimal tiles from their surrounding markup.
+		var anchors = dom.querySelectorAll("a[href*='viewkey=']");
+		for (var a = 0; a < anchors.length; a++) {
+			var anc = anchors[a];
+			var href = anc.getAttribute("href") || "";
+			var keyMatch = href.match(/viewkey=([a-zA-Z0-9]+)/);
+			if (!keyMatch) continue;
+			var vid = keyMatch[1];
+			if (seen[vid]) continue;
+			seen[vid] = true;
+			var img = anc.querySelector("img");
+			var thumb = img ? (img.getAttribute("data-thumb_url") || img.getAttribute("data-src") || img.getAttribute("src") || "") : "";
+			var titleEl = anc.querySelector(".title, .thumbnailTitle, var.duration");
+			var title = (img && (img.getAttribute("alt") || img.getAttribute("data-title")))
+				|| anc.getAttribute("data-title")
+				|| anc.getAttribute("title")
+				|| (titleEl ? titleEl.textContent.trim() : "")
+				|| "";
+			var videoUrl = href.startsWith("http") ? href : (URL_BASE + href);
+			out.push({
+				id: vid,
+				name: title,
+				thumb: thumb,
+				duration: 0,
+				views: 0,
+				videoUrl: videoUrl,
+				authorName: "",
+				authorUrl: ""
+			});
+		}
+		var hasNextAnchor = dom.querySelector("li.page_next a, a.page_next, .pagination a[rel='next']");
+		var hasNextOnly = false;
+		if (hasNextAnchor) {
+			var hh = hasNextAnchor.getAttribute("href") || "";
+			if (hh && hh !== "#") hasNextOnly = true;
+		}
+		return { videos: out, hasNext: hasNextOnly };
+	}
+	for (var i = 0; i < lis.length; i++) {
+		var li = lis[i];
+		var videoId = li.getAttribute("data-video-id");
+		if (!videoId) {
+			// Try to extract from a child anchor with viewkey=
+			var a0 = li.querySelector("a[href*='viewkey=']");
+			if (a0) {
+				var h0 = a0.getAttribute("href") || "";
+				var km = h0.match(/viewkey=([a-zA-Z0-9]+)/);
+				if (km) videoId = km[1];
+			}
+		}
+		if (!videoId) continue;
+		if (seen[videoId]) continue;
+		seen[videoId] = true;
+		var a = li.querySelector("a.js-linkVideoThumb, a.thumbnailTitle, a[href*='view_video'], a[href*='viewkey=']");
+		if (!a) continue;
+		var videoUrl = a.getAttribute("href");
+		if (!videoUrl) continue;
+		if (!videoUrl.startsWith("http")) videoUrl = URL_BASE + videoUrl;
+		var img2 = li.querySelector("img");
+		var thumb2 = img2 ? (img2.getAttribute("data-thumb_url") || img2.getAttribute("data-src") || img2.getAttribute("src") || "") : "";
+		var title2 = (img2 && (img2.getAttribute("alt") || img2.getAttribute("data-title")))
+			|| a.getAttribute("data-title")
+			|| a.getAttribute("title")
+			|| "";
+		var dEl = li.querySelector("var.duration, .duration");
+		var dur = dEl ? parseDuration(dEl.textContent.trim()) : 0;
+		var vEl = li.querySelector(".views var, .views");
+		var views = vEl ? parseNumberSuffix(vEl.textContent.trim()) : 0;
+		var authorA = li.querySelector(".usernameWrap a, a[href*='/model/'], a[href*='/pornstar/'], a[href*='/channels/'], a[href*='/users/']");
+		var authorName = authorA ? authorA.textContent.trim() : "";
+		var authorUrl = authorA ? (URL_BASE + authorA.getAttribute("href")) : "";
+		out.push({
+			id: videoId,
+			name: title2,
+			thumb: thumb2,
+			duration: dur,
+			views: views,
+			videoUrl: videoUrl,
+			authorName: authorName,
+			authorUrl: authorUrl
+		});
+	}
+	// Has next page?
+	var pageNext = dom.querySelector("li.page_next a, a.page_next, .pagination a[rel='next']");
+	var hasNext = false;
+	if (pageNext) {
+		var h = pageNext.getAttribute("href") || "";
+		if (h && h !== "#") hasNext = true;
+	}
+	return { videos: out, hasNext: hasNext };
 }
 
-function trySearchDirectUrl(query) {
-    if (!query || typeof query !== "string") return null;
-    if (query.toLowerCase().indexOf("pmvhaven.com") < 0) return null;
-    const url = normalizePmvUrl(query);
-    try {
-        // Playlist link -> the playlist card.
-        if (/\/playlists?\//i.test(url)) {
-            const plId = extractPlaylistIdFromUrl(url);
-            if (plId) {
-                const resp = jsonGETNoThrow(BASE_URL + "/api/playlists/" + plId);
-                if (resp && resp.data) return new ContentPager([toPlatformPlaylist(resp.data)], false);
-            }
-        }
-        // Video link -> the video card.
-        if (source.isContentDetailsUrl(url)) {
-            const vid = extractVideoIdFromUrl(url);
-            if (vid) {
-                const r = jsonGETNoThrow(BASE_URL + "/api/videos/" + vid);
-                if (r && r.data) return new ContentPager([toPlatformVideo(r.data)], false);
-            }
-        }
-        // Profile link -> the channel card.
-        if (source.isChannelUrl(url)) {
-            try { return new ContentPager([source.getChannel(url)], false); }
-            catch (e) { /* fall through */ }
-        }
-    } catch (e) {
-        log("trySearchDirectUrl error: " + e);
-    }
-    return null;
+source.getPlaylist = function (url) {
+	if (isVirtualPlaylistUrl(url)) {
+		return getVirtualPlaylistDetails(url);
+	}
+	// Map non-numeric virtual URLs to the right kind so the user can paste
+	// them directly into Grayjay.
+	if (/\/playlist\/watchlater\b/.test(url)) return getVirtualPlaylistDetails(VPL_WATCH_LATER_URL);
+	if (/\/likedvideos\b/.test(url)) return getVirtualPlaylistDetails(VPL_LIKED_URL);
+	if (/\/subscriptions\b/.test(url) && !/\/users\//.test(url)) return getVirtualPlaylistDetails(VPL_SUBS_FEED_URL);
+
+	var id = _extractPlaylistIdFromUrl(url);
+	if (!id) throw new ScriptException("Invalid playlist URL: " + url);
+
+	var html;
+	try {
+		html = httpGET(URL_BASE + "/playlist/" + id, {});
+	} catch (e) {
+		throw new ScriptException("Playlist fetch failed: " + e);
+	}
+	var dom = domParser.parseFromString(html);
+
+	// Title
+	var titleEl = dom.querySelector("h1.playlistTitle, h1.title, div.playlist-info h1, h1");
+	var name = titleEl ? titleEl.textContent.trim() : ("Playlist " + id);
+
+	// Owner
+	var ownerA = dom.querySelector(".playlistMeta a.usernameLink, .playlistBy a, a[href*='/users/'][class*='username']");
+	var ownerName = ownerA ? ownerA.textContent.trim() : "";
+	var ownerUrl = ownerA ? (URL_BASE + ownerA.getAttribute("href")) : "";
+	var ownerImg = dom.querySelector(".playlistMeta img, .playlist-info img");
+	var ownerAvatar = ownerImg ? (ownerImg.getAttribute("src") || "") : "";
+
+	// Videos in this playlist page.
+	var parsed = _parsePlaylistVideos(html);
+
+	var author = ownerName
+		? new PlatformAuthorLink(new PlatformID(PLATFORM, ownerName, config.id), ownerName, ownerUrl, ownerAvatar)
+		: new PlatformAuthorLink(new PlatformID(PLATFORM, "", config.id), "", "", "");
+
+	var pvids = parsed.videos.map(_videoToPlatformVideo);
+
+	return new PlatformPlaylistDetails({
+		id: new PlatformID(PLATFORM, id, config.id),
+		name: name,
+		thumbnail: (parsed.videos[0] && parsed.videos[0].thumb) || "",
+		author: author,
+		datetime: Math.floor(Date.now() / 1000),
+		url: url,
+		videoCount: pvids.length,
+		contents: new VideoPager(pvids, false)
+	});
+};
+
+function _videoToPlatformVideo(v) {
+	return new PlatformVideo({
+		id: new PlatformID(PLATFORM, v.id, config.id),
+		name: v.name || "",
+		thumbnails: new Thumbnails([new Thumbnail(v.thumb || "", 0)]),
+		author: new PlatformAuthorLink(new PlatformID(PLATFORM, v.authorName || "", config.id),
+			v.authorName || "",
+			v.authorUrl || "",
+			""),
+		datetime: v.datetime || undefined,
+		duration: v.duration || 0,
+		viewCount: v.views || 0,
+		url: v.videoUrl,
+		isLive: false
+	});
 }
 
-// ---------- channel ----------
-
-source.isChannelUrl = function(url) {
-    return /^https?:\/\/(?:www\.)?pmvhaven\.com\/profile\/[^\/\?#]+/.test(url);
-};
-
-source.getChannel = function(url) {
-    const token = extractUsernameFromProfileUrl(url);
-    if (!token) throw new ScriptException("Invalid channel URL: " + url);
-
-    const userData = fetchUserByToken(token);
-    if (!userData) {
-        throw new ScriptException("Profile not found for " + token);
-    }
-    const userId = userData._id;
-
-    let subCount = 0;
-    try {
-        const sc = jsonGETNoThrow(BASE_URL + "/api/users/" + userId + "/subscriber-count");
-        if (sc && typeof sc.count === "number") subCount = sc.count;
-    } catch (e) { /* ignore */ }
-
-    return toPlatformChannel(userData, subCount);
-};
-
-source.getChannelCapabilities = function() {
-    return {
-        types: [Type.Feed.Videos],
-        sorts: [Type.Order.Chronological],
-        filters: []
-    };
-};
-
-source.getChannelContents = function(url) {
-    const token = extractUsernameFromProfileUrl(url);
-    if (!token) return new ContentPager([], false);
-    // Channel video listing keys off the username; resolve id-based profile
-    // URLs (pmvhaven uses the user _id in profile links) to the username first.
-    let username = token;
-    if (isObjectId(token)) {
-        const u = fetchUserByToken(token);
-        username = u && u.username;
-    }
-    if (!username) return new ContentPager([], false);
-    return new ChannelVideosPager(username);
-};
-
-source.getChannelVideos = function(url) {
-    return source.getChannelContents(url);
-};
-
-// Grayjay shows a "Playlists" tab on the channel page when this optional hook
-// is present. Lists every public playlist created by the profile's owner.
-source.getChannelPlaylists = function(url) {
-    const token = extractUsernameFromProfileUrl(url);
-    if (!token) return new PlaylistPager([], false);
-    return new ChannelPlaylistsPager(token);
-};
-
-// ---------- video ----------
-
-source.isContentDetailsUrl = function(url) {
-    return /^https?:\/\/(?:www\.)?pmvhaven\.com\/video\//.test(url);
-};
-
-source.getContentDetails = function(url) {
-    const id = extractVideoIdFromUrl(url);
-    if (!id) throw new ScriptException("Could not extract video id from " + url);
-
-    const resp = jsonGETNoThrow(BASE_URL + "/api/videos/" + id);
-    if (!resp || !resp.data) throw new ScriptException("Video not found: " + id);
-    const v = resp.data;
-
-    const sources = [];
-    if (v.hlsEnabled && v.hlsMasterPlaylistUrl) {
-        sources.push(new HLSSource({
-            name: "HLS",
-            duration: v.durationSeconds || parseDuration(v.duration),
-            url: v.hlsMasterPlaylistUrl
-        }));
-    }
-    if (v.videoUrl) {
-        sources.push(new VideoUrlSource({
-            container: v.contentType || "video/mp4",
-            name: (v.width && v.height) ? (v.height + "p") : "mp4",
-            width: v.width || 0,
-            height: v.height || 0,
-            url: v.videoUrl,
-            duration: v.durationSeconds || parseDuration(v.duration)
-        }));
-    }
-
-    const details = new PlatformVideoDetails({
-        id: new PlatformID(PLATFORM, id, config.id),
-        name: v.title || "Untitled",
-        thumbnails: v.thumbnailUrl ? new Thumbnails([new Thumbnail(v.thumbnailUrl, 720)]) : new Thumbnails([]),
-        author: createAuthor(v.uploader, v.uploaderUsername, v.uploaderAvatarUrl),
-        datetime: parseDateSeconds(v.uploadDate || v.createdAt),
-        duration: v.durationSeconds || parseDuration(v.duration),
-        viewCount: v.views || 0,
-        url: url,
-        isLive: false,
-        description: v.description || "",
-        video: new VideoSourceDescriptor(sources),
-        rating: new RatingLikesDislikes(v.likes || 0, v.dislikes || 0)
-    });
-    if (typeof v.watchProgress === "number" && v.watchProgress > 0) {
-        try { details.playbackTime = Math.floor(v.watchProgress); } catch (e) { /* ignore */ }
-    }
-    // Grayjay reads recommended videos from a method on the details object
-    // itself (see uarasio/SB-GJ for the same pattern). Without this hook the
-    // "More videos" rail under a video stays empty even if
-    // source.getContentRecommendations is defined.
-    details.getContentRecommendations = function() {
-        return source.getContentRecommendations(url, details);
-    };
-    return details;
-};
-
-// ---------- actions (subscribe / like / dislike / watch-progress push) ----------
-
-source.actionSubscribe = function(channelUrl, subscribe) {
-    try {
-        const token = extractUsernameFromProfileUrl(channelUrl);
-        if (!token) return false;
-        const userData = fetchUserByToken(token);
-        const userId = userData && userData._id;
-        if (!userId) return false;
-        const r = jsonRequest("PUT", BASE_URL + "/api/users/" + userId + "/subscribe",
-            { action: subscribe === false ? "unsubscribe" : "subscribe" }, true);
-        return !!r;
-    } catch (e) { log("actionSubscribe error: " + e); return false; }
-};
-
-source.actionLike = function(videoUrl, like) {
-    const id = extractVideoIdFromUrl(videoUrl);
-    if (!id) return false;
-    const r = jsonRequest("PUT", BASE_URL + "/api/videos/" + id + "/like",
-        { action: like === false ? "unlike" : "like" }, true);
-    return !!r;
-};
-
-source.actionDislike = function(videoUrl, dislike) {
-    const id = extractVideoIdFromUrl(videoUrl);
-    if (!id) return false;
-    const r = jsonRequest("PUT", BASE_URL + "/api/videos/" + id + "/dislike",
-        { action: dislike === false ? "undislike" : "dislike" }, true);
-    return !!r;
-};
-
-// Push local playback progress back to the server (called by Grayjay when the
-// user pauses / leaves a video, if Grayjay reflects the hook).
-source.savePlaybackState = function(url, watchTimeSeconds) {
-    try {
-        if (!source.isLoggedIn()) return false;
-        const id = extractVideoIdFromUrl(url);
-        if (!id) return false;
-        const progress = Math.max(0, Math.round(Number(watchTimeSeconds) || 0));
-        const r = jsonRequest("PUT", BASE_URL + "/api/users/watch-progress",
-            { videoId: id, progress: progress }, true);
-        return !!r;
-    } catch (e) { log("savePlaybackState error: " + e); return false; }
-};
-// Alias for compatibility with possible Grayjay hook names.
-source.actionWatchProgress = source.savePlaybackState;
-
-source.getContentRecommendations = function(url, initialData) {
-    const id = extractVideoIdFromUrl(url);
-    if (!id) return new ContentPager([], false);
-    try {
-        const data = jsonGETNoThrow(BASE_URL + "/api/videos/" + id + "/recommendations-es?limit=20");
-        const list = (data && (data.videos || data.data)) || [];
-        const vids = list.map(toPlatformVideo);
-        return new ContentPager(vids, false);
-    } catch (e) {
-        log("recommendations error: " + e);
-        return new ContentPager([], false);
-    }
-};
-
-// ---------- comments ----------
-
-source.getComments = function(url) {
-    const id = extractVideoIdFromUrl(url);
-    if (!id) return new CommentPager([], false);
-    return new VideoCommentPager(url, id, 1);
-};
-
-source.getSubComments = function(comment) {
-    if (!comment || !comment.context) return new CommentPager([], false);
-    const replies = comment.context.replies || [];
-    return new CommentPager(
-        replies.map(r => buildComment(r, comment.context.videoUrl, comment.context.videoId, null)),
-        false
-    );
-};
-
-function buildComment(c, videoUrl, videoId, parentForReplies) {
-    const author = c.username
-        ? new PlatformAuthorLink(
-            new PlatformID(PLATFORM, c.username, config.id),
-            c.username,
-            channelUrlFromUsername(c.username),
-            c.avatarUrl || ""
-          )
-        : new PlatformAuthorLink(new PlatformID(PLATFORM, "", config.id), "", "", "");
-    const replyCount = Array.isArray(c.replies) ? c.replies.length : 0;
-    return new Comment({
-        contextUrl: videoUrl,
-        author: author,
-        message: c.text || "",
-        rating: new RatingLikesDislikes(c.likes || 0, c.dislikes || 0),
-        date: parseDateSeconds(c.createdAt),
-        replyCount: replyCount,
-        context: {
-            videoUrl: videoUrl,
-            videoId: videoId,
-            replies: c.replies || []
-        }
-    });
+class PornhubPlaylistsPager extends PlaylistPager {
+	constructor(query, page) {
+		super([], true);
+		this.query = query;
+		this.page = page || 1;
+		this._load();
+	}
+	_load() {
+		try {
+			var url = URL_BASE + "/playlist/search" + buildQuery({ search: this.query, page: this.page });
+			var html = httpGET(url, {});
+			var items = _parsePlaylistListItems(html);
+			var out = items.map(p => new PlatformPlaylist({
+				id: new PlatformID(PLATFORM, p.id, config.id),
+				name: p.name,
+				thumbnail: p.thumbnail || "",
+				author: p.ownerName
+					? new PlatformAuthorLink(new PlatformID(PLATFORM, p.ownerName, config.id), p.ownerName, p.ownerUrl, "")
+					: new PlatformAuthorLink(new PlatformID(PLATFORM, "", config.id), "", "", ""),
+				datetime: Math.floor(Date.now() / 1000),
+				url: _playlistUrlFromId(p.id),
+				videoCount: p.videoCount || 0
+			}));
+			this.results = out;
+			// Detect more pages.
+			var dom = domParser.parseFromString(html);
+			var pageNext = dom.querySelector("li.page_next a, a.page_next, .pagination a[rel='next']");
+			this.hasMore = !!(pageNext && pageNext.getAttribute("href") && pageNext.getAttribute("href") !== "#");
+			if (!this.hasMore && out.length >= 20) this.hasMore = true;
+		} catch (e) {
+			log("PornhubPlaylistsPager._load error: " + e);
+			this.results = [];
+			this.hasMore = false;
+		}
+	}
+	nextPage() {
+		this.page++;
+		this._load();
+		return this;
+	}
 }
 
-// ---------- playlist ----------
+// ====================================================================
+// Virtual playlists  (Favorites, Watch Later, Liked Videos, Subs Feed)
+// ====================================================================
+// All four show up under "Import Playlists" in Grayjay. URLs match the
+// canonical pornhub URLs so that opening them in a browser still works.
 
-// Virtual playlist URLs for the logged-in user's personal lists. They map
-// 1:1 to dedicated API endpoints (favorites / watch-later) and are exposed
-// alongside real playlists so Grayjay's "Import Playlists" picks them up.
-const VPL_FAVORITES   = BASE_URL + "/user/favorites";
-const VPL_WATCH_LATER = BASE_URL + "/user/watch-later";
+function _vplFavoritesUrl() {
+	var p = state.userPath || "0";
+	return URL_BASE + "/users/" + encodeURIComponent(p) + "/videos/favorites";
+}
+const VPL_WATCH_LATER_URL = URL_BASE + "/playlist/watchlater";
+const VPL_LIKED_URL       = URL_BASE + "/likedvideos";
+const VPL_SUBS_FEED_URL   = URL_BASE + "/subscriptions";
 
 function isVirtualPlaylistUrl(url) {
-    return url === VPL_FAVORITES || url === VPL_WATCH_LATER;
+	if (!url) return false;
+	if (url === VPL_WATCH_LATER_URL) return true;
+	if (url === VPL_LIKED_URL) return true;
+	if (url === VPL_SUBS_FEED_URL) return true;
+	if (/\/users\/[^\/]+\/videos\/favorites\b/.test(url)) return true;
+	return false;
 }
 
-function fetchVirtualPlaylist(kind) {
-    // kind: "favorites" | "watch-later"
-    // Pages through the full list and returns a {name, videos[]} payload.
-    const out = [];
-    let page = 1;
-    const limit = 50;
-    while (page <= 20) { // safety cap (1000 videos max per virtual list)
-        const endpoint = (kind === "favorites")
-            ? "/api/user/favorites" + buildQuery({ page: page, limit: limit, sortBy: "added", sortOrder: "desc" })
-            : "/api/user/watch-later" + buildQuery({ page: page, limit: limit });
-        const resp = jsonGETNoThrow(BASE_URL + endpoint, true);
-        if (!resp) break;
-        const items = resp.favorites || resp.videos || resp.data || [];
-        if (!Array.isArray(items) || items.length === 0) break;
-        for (let i = 0; i < items.length; i++) out.push(items[i]);
-        const pag = resp.pagination || {};
-        if (items.length < limit) break;
-        if (typeof pag.totalPages === "number" && page >= pag.totalPages) break;
-        page++;
-    }
-    return {
-        name: (kind === "favorites") ? "Favorites" : "Watch Later",
-        videos: out
-    };
+function virtualPlaylistKindFromUrl(url) {
+	if (url === VPL_WATCH_LATER_URL) return "watchlater";
+	if (url === VPL_LIKED_URL) return "liked";
+	if (url === VPL_SUBS_FEED_URL) return "subs";
+	if (/\/users\/[^\/]+\/videos\/favorites\b/.test(url)) return "favorites";
+	return null;
 }
 
-source.isPlaylistUrl = function(url) {
-    if (isVirtualPlaylistUrl(url)) return true;
-    return /^https?:\/\/(?:www\.)?pmvhaven\.com\/playlists\/[a-f0-9]{24}/i.test(url);
+function _fetchVirtualPlaylistVideos(basePath) {
+	var out = [];
+	for (var page = 1; page <= 50; page++) {
+		var url = URL_BASE + basePath + buildQuery({ page: page });
+		var html;
+		try { html = httpGET(url, {}); } catch (e) { log("virtualPL " + basePath + " p" + page + ": " + e); break; }
+		var parsed = _parsePlaylistVideos(html);
+		if (!parsed.videos.length) break;
+		for (var i = 0; i < parsed.videos.length; i++) out.push(parsed.videos[i]);
+		if (!parsed.hasNext) break;
+	}
+	return out;
+}
+
+function getVirtualPlaylistDetails(url) {
+	if (!source.isLoggedIn()) throw new ScriptException("Login required for " + url);
+	var kind = virtualPlaylistKindFromUrl(url);
+	var name, basePath;
+	switch (kind) {
+		case "favorites":
+			if (!state.userPath) validateSession();
+			if (!state.userPath) throw new ScriptException("Unable to resolve user path");
+			name = "Favorites"; basePath = "/users/" + encodeURIComponent(state.userPath) + "/videos/favorites"; break;
+		case "watchlater":
+			name = "Watch Later"; basePath = "/playlist/watchlater"; break;
+		case "liked":
+			name = "Liked Videos"; basePath = "/likedvideos"; break;
+		case "subs":
+			name = "Subscriptions Feed"; basePath = "/subscriptions"; break;
+		default:
+			throw new ScriptException("Unknown virtual playlist: " + url);
+	}
+	var videos = _fetchVirtualPlaylistVideos(basePath);
+	var author = state.username
+		? new PlatformAuthorLink(new PlatformID(PLATFORM, state.username, config.id),
+			state.username, URL_BASE + "/users/" + encodeURIComponent(state.userPath || ""), "")
+		: new PlatformAuthorLink(new PlatformID(PLATFORM, "", config.id), "", "", "");
+	var pvids = videos.map(_videoToPlatformVideo);
+	return new PlatformPlaylistDetails({
+		id: new PlatformID(PLATFORM, kind, config.id),
+		name: name,
+		thumbnail: (videos[0] && videos[0].thumb) || "",
+		author: author,
+		datetime: Math.floor(Date.now() / 1000),
+		url: url,
+		videoCount: pvids.length,
+		contents: new VideoPager(pvids, false)
+	});
+}
+
+// ====================================================================
+// Subscription & playlist migration
+// ====================================================================
+
+function _parseProfileLinksFromHtml(html, sectionKind) {
+	// sectionKind: "user" | "pornstar" | "channel"
+	// Returns absolute pornhub URLs to the subscribed profile root.
+	var dom = domParser.parseFromString(html);
+	var out = [];
+	var seen = {};
+	var selector, urlPrefix, hrefRegex;
+	if (sectionKind === "pornstar") {
+		selector = "a[href^='/pornstar/']";
+		hrefRegex = /^\/pornstar\/([^\/\?#]+)\/?$/;
+		urlPrefix = "/pornstar/";
+	} else if (sectionKind === "channel") {
+		selector = "a[href^='/channels/']";
+		hrefRegex = /^\/channels\/([^\/\?#]+)\/?$/;
+		urlPrefix = "/channels/";
+	} else {
+		// regular user accounts subscribed to
+		selector = "a[href^='/users/']";
+		hrefRegex = /^\/users\/([^\/\?#]+)\/?$/;
+		urlPrefix = "/users/";
+	}
+	var anchors = dom.querySelectorAll(selector);
+	for (var i = 0; i < anchors.length; i++) {
+		var href = anchors[i].getAttribute("href") || "";
+		var m = href.match(hrefRegex);
+		if (!m) continue;
+		// Skip the current user's own profile.
+		if (sectionKind === "user" && state.userPath && m[1] === state.userPath) continue;
+		var name = m[1];
+		if (seen[name]) continue;
+		seen[name] = true;
+		out.push(URL_BASE + urlPrefix + name);
+	}
+	return out;
+}
+
+function _hasNextPornhubPage(html) {
+	if (!html) return false;
+	// Pornhub paginators: <li class="page_next"> or <a class="page_next">
+	if (/class=["'][^"']*page_next[^"']*["']/.test(html)) {
+		// only "next" if not disabled
+		return !/page_next[^"]*["'][^>]*disabled/.test(html);
+	}
+	return false;
+}
+
+source.getUserSubscriptions = function () {
+	try {
+		if (!source.isLoggedIn()) {
+			log("getUserSubscriptions: not logged in");
+			return [];
+		}
+		if (!state.userPath) validateSession();
+		if (!state.userPath) {
+			log("getUserSubscriptions: could not resolve userPath");
+			return [];
+		}
+		var out = [];
+		var seen = {};
+		// Pornhub keeps three separate subscription lists; iterate all of them.
+		var sections = [
+			{ kind: "user",     base: "/users/" + encodeURIComponent(state.userPath) + "/subscriptions" },
+			{ kind: "pornstar", base: "/users/" + encodeURIComponent(state.userPath) + "/pornstar_subscriptions" },
+			{ kind: "channel",  base: "/users/" + encodeURIComponent(state.userPath) + "/channel_subscriptions" }
+		];
+		for (var si = 0; si < sections.length; si++) {
+			var sec = sections[si];
+			for (var page = 1; page <= 50; page++) {
+				var url = URL_BASE + sec.base + buildQuery({ page: page });
+				var html;
+				try { html = httpGET(url, {}); } catch (e) { log("getUserSubscriptions " + sec.base + " p" + page + ": " + e); break; }
+				if (!html) break;
+				var found = _parseProfileLinksFromHtml(html, sec.kind);
+				var added = 0;
+				for (var k = 0; k < found.length; k++) {
+					var u = found[k];
+					if (seen[u]) continue;
+					seen[u] = true;
+					out.push(u);
+					added++;
+				}
+				log("getUserSubscriptions " + sec.kind + " p" + page + ": +" + added + " (total " + out.length + ")");
+				if (!added) break;
+				if (!_hasNextPornhubPage(html)) break;
+			}
+		}
+		log("getUserSubscriptions: returning " + out.length + " channel(s)");
+		return out;
+	} catch (e) {
+		log("getUserSubscriptions error: " + e);
+		return [];
+	}
 };
 
-source.getPlaylist = function(url) {
-    // Virtual playlists (favorites / watch-later) are session-scoped lists
-    // populated from dedicated endpoints.
-    if (isVirtualPlaylistUrl(url)) {
-        if (!source.isLoggedIn()) throw new ScriptException("Login required for " + url);
-        const kind = (url === VPL_FAVORITES) ? "favorites" : "watch-later";
-        const pl = fetchVirtualPlaylist(kind);
-        const author = state.username
-            ? new PlatformAuthorLink(
-                new PlatformID(PLATFORM, state.username, config.id),
-                state.username,
-                channelUrlFromUsername(state.username),
-                ""
-              )
-            : new PlatformAuthorLink(new PlatformID(PLATFORM, "", config.id), "", "", "");
-        const videos = pl.videos.map(toPlatformVideo);
-        return new PlatformPlaylistDetails({
-            id: new PlatformID(PLATFORM, kind, config.id),
-            name: pl.name,
-            thumbnail: videos.length && videos[0] ? "" : "",
-            author: author,
-            datetime: Math.floor(Date.now() / 1000),
-            url: url,
-            videoCount: videos.length,
-            contents: new VideoPager(videos, false)
-        });
-    }
-
-    const id = extractPlaylistIdFromUrl(url);
-    if (!id) throw new ScriptException("Invalid playlist URL: " + url);
-    const resp = jsonGETNoThrow(BASE_URL + "/api/playlists/" + id);
-    if (!resp || !resp.data) throw new ScriptException("Playlist not found: " + id);
-    const p = resp.data;
-    const ownerName = p.ownerUsername || p.owner || "";
-    const author = ownerName
-        ? new PlatformAuthorLink(
-            new PlatformID(PLATFORM, ownerName, config.id),
-            ownerName,
-            channelUrlFromUsername(ownerName),
-            p.ownerAvatarUrl || ""
-          )
-        : new PlatformAuthorLink(new PlatformID(PLATFORM, "", config.id), "", "", "");
-
-    const details = (p.videoDetails || []).map(toPlatformVideo);
-
-    return new PlatformPlaylistDetails({
-        id: new PlatformID(PLATFORM, id, config.id),
-        name: p.name || "Playlist",
-        thumbnail: p.thumbnail || (details.length ? "" : ""),
-        author: author,
-        datetime: parseDateSeconds(p.createdAt),
-        url: url,
-        videoCount: details.length,
-        contents: new VideoPager(details, false)
-    });
+source.getUserPlaylists = function () {
+	try {
+		if (!source.isLoggedIn()) {
+			log("getUserPlaylists: not logged in");
+			return [];
+		}
+		if (!state.userPath) validateSession();
+		var seen = {};
+		var out = [];
+		// User-owned playlists at /users/<id>/playlists?page=N
+		if (state.userPath) {
+			var basePath = "/users/" + encodeURIComponent(state.userPath) + "/playlists";
+			for (var page = 1; page <= 30; page++) {
+				var url = URL_BASE + basePath + buildQuery({ page: page });
+				var html;
+				try { html = httpGET(url, {}); } catch (e) { log("getUserPlaylists p" + page + ": " + e); break; }
+				if (!html) break;
+				var added = 0;
+				var items = _parsePlaylistListItems(html);
+				for (var i = 0; i < items.length; i++) {
+					var p = items[i];
+					if (!p.id || seen[p.id]) continue;
+					seen[p.id] = true;
+					out.push(_playlistUrlFromId(p.id));
+					added++;
+				}
+				if (!added) {
+					// Fallback: direct anchor scan
+					var dom2 = domParser.parseFromString(html);
+					var as = dom2.querySelectorAll("a[href*='/playlist/']");
+					for (var j = 0; j < as.length; j++) {
+						var href = as[j].getAttribute("href") || "";
+						var mm = href.match(/\/playlist\/(\d+)/);
+						if (!mm) continue;
+						if (seen[mm[1]]) continue;
+						seen[mm[1]] = true;
+						out.push(_playlistUrlFromId(mm[1]));
+						added++;
+					}
+					if (!added) break;
+				}
+				log("getUserPlaylists p" + page + ": +" + added + " (total " + out.length + ")");
+				if (!_hasNextPornhubPage(html)) break;
+			}
+		}
+		// Append the four virtual lists (always available when logged in).
+		out.push(_vplFavoritesUrl());
+		out.push(VPL_WATCH_LATER_URL);
+		out.push(VPL_LIKED_URL);
+		out.push(VPL_SUBS_FEED_URL);
+		log("getUserPlaylists: returning " + out.length + " playlist(s) (incl. Favorites/WatchLater/Liked/SubsFeed)");
+		return out;
+	} catch (e) {
+		log("getUserPlaylists error: " + e);
+		return [];
+	}
 };
 
-// ---------- subscription/playlist migration ----------
+// ====================================================================
+// Remote watch history (Pornhub -> Grayjay)
+// ====================================================================
 
-source.getUserSubscriptions = function() {
-    // Returns list of channel URLs the logged-in user is subscribed to.
-    // PMVHaven returns at most `limit` per page; iterate until exhausted so
-    // big subscription lists migrate fully into Grayjay.
-    try {
-        if (!source.isLoggedIn()) {
-            log("getUserSubscriptions: not logged in");
-            return [];
-        }
-        if (!state.userId) { fetchUserInfo(); }
-        if (!state.userId) return [];
+// Build a PlatformVideo for watch-history import. CRITICAL (per Grayjay):
+//   - playbackDate must be > 0 AND must be passed IN the constructor.
+//   - playbackTime must be > 0 AND must be passed IN the constructor, else
+//     Grayjay silently drops the entry from sync.
+function _createHistoryPlatformVideo(v, watchedSecondsOrder) {
+	var playbackDate = (watchedSecondsOrder && watchedSecondsOrder.watchedAt > 0)
+		? watchedSecondsOrder.watchedAt
+		: Math.floor(Date.now() / 1000) - (watchedSecondsOrder ? watchedSecondsOrder.order * 60 : 0);
+	var playbackTime = Math.max(60, Math.floor((v.duration || 300) * 0.5));
+	return new PlatformVideo({
+		id: new PlatformID(PLATFORM, v.id, config.id),
+		name: v.name || "",
+		thumbnails: new Thumbnails([new Thumbnail(v.thumb || "", 0)]),
+		author: new PlatformAuthorLink(new PlatformID(PLATFORM, v.authorName || "", config.id),
+			v.authorName || "",
+			v.authorUrl || "",
+			""),
+		datetime: v.datetime || playbackDate,
+		duration: v.duration || 0,
+		viewCount: v.views || 0,
+		url: v.videoUrl,
+		isLive: false,
+		playbackDate: playbackDate,
+		playbackTime: playbackTime
+	});
+}
 
-        const seen = {};
-        const out = [];
-        let page = 1;
-        const limit = 100;
-        while (page <= 50) { // safety cap
-            const resp = jsonGETNoThrow(
-                BASE_URL + "/api/users/" + state.userId + "/subscriptions" +
-                buildQuery({ page: page, limit: limit }), true);
-            if (!resp || resp.success === false) break;
-            const list = resp.data || [];
-            if (!Array.isArray(list) || list.length === 0) break;
-            for (let i = 0; i < list.length; i++) {
-                const u = list[i];
-                if (!u || !u.username || seen[u.username]) continue;
-                seen[u.username] = true;
-                out.push(channelUrlFromUsername(u.username));
-            }
-            const pag = resp.pagination || {};
-            if (list.length < limit) break;
-            if (pag.hasMore === false) break;
-            if (typeof pag.totalPages === "number" && page >= pag.totalPages) break;
-            page++;
-        }
-        log("getUserSubscriptions: returning " + out.length + " channel(s)");
-        return out;
-    } catch (e) {
-        log("getUserSubscriptions error: " + e);
-        return [];
-    }
+// Grayjay detects "Sync Remote History" support by the presence of
+// source.getUserHistory. When enabled, this is called on startup.
+source.getUserHistory = function () {
+	return source.syncRemoteWatchHistory(null);
 };
 
-source.getUserPlaylists = function() {
-    // Returns list of playlist URLs owned by the logged-in user, plus the
-    // virtual Favorites and Watch Later playlists so Grayjay's "Import
-    // Playlists" picks all three up in one go.
-    try {
-        if (!source.isLoggedIn()) {
-            log("getUserPlaylists: not logged in");
-            return [];
-        }
-        if (!state.userId) { fetchUserInfo(); }
-
-        const out = [];
-
-        // Real, user-created playlists (paginate to be safe).
-        if (state.userId) {
-            const seen = {};
-            let page = 1;
-            const limit = 100;
-            while (page <= 20) {
-                const resp = jsonGETNoThrow(BASE_URL + "/api/playlists" + buildQuery({
-                    owner: state.userId,
-                    page: page,
-                    limit: limit,
-                    sort: "-createdAt"
-                }), true);
-                if (!resp || resp.success === false) break;
-                const list = resp.data || [];
-                if (!Array.isArray(list) || list.length === 0) break;
-                for (let i = 0; i < list.length; i++) {
-                    const pl = list[i];
-                    if (!pl || !pl._id || seen[pl._id]) continue;
-                    seen[pl._id] = true;
-                    out.push(playlistUrlFromId(pl._id));
-                }
-                const meta = resp.meta || {};
-                if (list.length < limit) break;
-                if (meta.hasMore === false) break;
-                if (typeof meta.totalPages === "number" && page >= meta.totalPages) break;
-                page++;
-            }
-        }
-
-        // Virtual session-scoped lists (always available when logged in).
-        out.push(VPL_FAVORITES);
-        out.push(VPL_WATCH_LATER);
-
-        log("getUserPlaylists: returning " + out.length + " playlist(s) (incl. Favorites + Watch Later)");
-        return out;
-    } catch (e) {
-        log("getUserPlaylists error: " + e);
-        return [];
-    }
+source.syncRemoteWatchHistory = function (continuationToken) {
+	try {
+		log("===== syncRemoteWatchHistory START =====");
+		if (!source.isLoggedIn()) {
+			log("syncRemoteWatchHistory: not logged in, skipping");
+			return new VideoPager([], false, { token: null });
+		}
+		if (!state.userPath) validateSession();
+		if (!state.userPath) {
+			log("syncRemoteWatchHistory: could not resolve userPath");
+			return new VideoPager([], false, { token: null });
+		}
+		var basePath = "/users/" + encodeURIComponent(state.userPath) + "/videos/recent";
+		var allItems = [];
+		for (var page = 1; page <= 50; page++) {
+			var url = URL_BASE + basePath + buildQuery({ page: page });
+			var html;
+			try { html = httpGET(url, {}); } catch (e) {
+				log("syncRemoteWatchHistory " + basePath + " p" + page + ": " + e);
+				break;
+			}
+			var parsed = _parsePlaylistVideos(html);
+			if (!parsed.videos.length) break;
+			for (var i = 0; i < parsed.videos.length; i++) allItems.push(parsed.videos[i]);
+			if (!parsed.hasNext) break;
+		}
+		if (!allItems.length) {
+			log("syncRemoteWatchHistory: no history found");
+			return new VideoPager([], false, { token: null });
+		}
+		var out = [];
+		for (var k = 0; k < allItems.length; k++) {
+			out.push(_createHistoryPlatformVideo(allItems[k], { watchedAt: 0, order: k }));
+		}
+		log("syncRemoteWatchHistory: returning " + out.length + " items");
+		log("===== syncRemoteWatchHistory END =====");
+		return new VideoPager(out, false, { token: null });
+	} catch (e) {
+		log("syncRemoteWatchHistory error: " + e);
+		return new VideoPager([], false, { token: null });
+	}
 };
 
-// ---------- remote watch history ----------
-
-// Grayjay (Android & Desktop) detects "Sync Remote History" support ONLY by the
-// presence of `source.getUserHistory` (JSClient.kt -> `!!source.getUserHistory`).
-// When the user enables the built-in "Sync > Sync Remote History" toggle, Grayjay
-// calls `source.getUserHistory()` on startup (StateHistory.syncRemoteHistory).
-// `source.syncRemoteWatchHistory` and `source.getCapabilities` are NOT used for
-// this, so defining getUserHistory is what makes the Sync tab appear AND import.
-source.getUserHistory = function() {
-    return source.syncRemoteWatchHistory(null);
-};
-
-source.syncRemoteWatchHistory = function(continuationToken) {
-    // IMPORTANT: Grayjay's startup sync only consumes the first page returned
-    // by this function (its pager loop has a hard cap). To import the entire
-    // history we paginate through PMVHaven internally and return everything
-    // in a single VideoPager with hasMore=false. Same approach as SB-GJ.
-    try {
-        log("===== syncRemoteWatchHistory START =====");
-        if (!source.isLoggedIn()) {
-            log("syncRemoteWatchHistory: not logged in, skipping");
-            return new VideoPager([], false, { token: null });
-        }
-
-        const MAX_PAGES = 100;
-        const PAGE_LIMIT = 48;
-        let allItems = [];
-        let usedPrimary = true;
-
-        // Primary endpoint: /api/user/history returns hydrated video objects
-        // with watchedAt + watchProgress in one shot.
-        for (let page = 1; page <= MAX_PAGES; page++) {
-            const resp = jsonGETNoThrow(BASE_URL + "/api/user/history" + buildQuery({
-                page: page, limit: PAGE_LIMIT, filter: "all", _t: Date.now()
-            }), true);
-
-            if (!resp) {
-                if (page === 1) { usedPrimary = false; break; }
-                log("syncRemoteWatchHistory: /history page " + page + " failed, stopping pagination");
-                break;
-            }
-            if (resp.success === false || !Array.isArray(resp.history)) {
-                if (page === 1) { usedPrimary = false; break; }
-                break;
-            }
-            const items = resp.history;
-            log("syncRemoteWatchHistory: /history page " + page + " -> " + items.length + " items");
-            if (items.length === 0) break;
-            allItems = allItems.concat(items);
-
-            const pag = resp.pagination || {};
-            if (typeof pag.totalPages === "number" && page >= pag.totalPages) break;
-            if (items.length < PAGE_LIMIT) break;
-        }
-
-        // Fallback: /api/user/watched-video-ids -> hydrate per id.
-        if (!usedPrimary) {
-            log("syncRemoteWatchHistory: /history unavailable, falling back to /watched-video-ids");
-            for (let page = 1; page <= MAX_PAGES; page++) {
-                const resp = jsonGETNoThrow(BASE_URL + "/api/user/watched-video-ids" + buildQuery({
-                    page: page, limit: PAGE_LIMIT
-                }), true);
-                if (!resp) break;
-                let entries = resp.data || resp.videoIds || resp.watched || [];
-                if (!Array.isArray(entries) || entries.length === 0) break;
-                for (let i = 0; i < entries.length; i++) {
-                    const e = entries[i];
-                    const videoId = typeof e === "string" ? e : (e && (e.videoId || e._id || e.id));
-                    if (!videoId) continue;
-                    const watchedAt = (e && e.watchedAt) || null;
-                    const vd = jsonGETNoThrow(BASE_URL + "/api/videos/" + videoId);
-                    if (!vd || !vd.data) continue;
-                    const v = vd.data;
-                    if (watchedAt && !v.watchedAt) v.watchedAt = watchedAt;
-                    allItems.push(v);
-                }
-                if (entries.length < PAGE_LIMIT) break;
-            }
-        }
-
-        if (allItems.length === 0) {
-            log("syncRemoteWatchHistory: no history found");
-            return new VideoPager([], false, { token: null });
-        }
-
-        // Build PlatformVideo objects with playbackDate / playbackTime set IN the
-        // constructor (Grayjay ignores them otherwise — see createHistoryPlatformVideo).
-        const out = [];
-        for (let i = 0; i < allItems.length; i++) {
-            const v = allItems[i];
-            if (!v || !v._id) continue;
-            const watchedSeconds = parseDateSeconds(v.watchedAt || v.lastWatchedAt);
-            out.push(createHistoryPlatformVideo(v, watchedSeconds, i));
-        }
-
-        log("syncRemoteWatchHistory: returning " + out.length + " total history items");
-        log("===== syncRemoteWatchHistory END =====");
-        return new VideoPager(out, false, { token: null });
-    } catch (e) {
-        log("syncRemoteWatchHistory: exception " + e);
-        return new VideoPager([], false, { token: null });
-    }
-};
-
-// ---------- pagers ----------
-
-class VideosApiPager extends ContentPager {
-    constructor(kind, payload) {
-        super([], true);
-        this.kind = kind; // "browse", "search" or "trending"
-        this.payload = payload || {};
-        this.page = 0;
-        this.seen = {};
-        this.nextPage();
-    }
-    nextPage() {
-        this.page++;
-        // PMVHaven's API paginates with `page` (the previous `index` param was
-        // silently ignored, which is why feeds repeated the same results). The
-        // browse feed lives at /api/videos, search/trending have sub-paths.
-        const path = (this.kind === "browse") ? "/api/videos" : ("/api/videos/" + this.kind);
-        const url = BASE_URL + path + buildQuery(
-            Object.assign({}, this.payload, { page: this.page, limit: 50 })
-        );
-        const data = jsonGETNoThrow(url);
-        if (!data || data.success === false) { this.hasMore = false; this.results = []; return this; }
-        const list = data.videos || data.data || [];
-        // De-duplicate across pages so already-seen videos never reappear.
-        const fresh = [];
-        for (let i = 0; i < list.length; i++) {
-            const v = list[i];
-            const id = v && (v._id || v.id);
-            if (!id || this.seen[id]) continue;
-            this.seen[id] = true;
-            fresh.push(toPlatformVideo(v));
-        }
-        this.results = fresh;
-        const pag = data.pagination || {};
-        if (typeof pag.hasNext === "boolean") this.hasMore = pag.hasNext;
-        else this.hasMore = list.length >= 50;
-        return this;
-    }
-}
-
-class ChannelVideosPager extends ContentPager {
-    constructor(username) {
-        super([], true);
-        this.username = username;
-        this.page = 0;
-        this.nextPage();
-    }
-    nextPage() {
-        this.page++;
-        const url = BASE_URL + "/api/videos" + buildQuery({
-            uploader: this.username,
-            page: this.page,
-            limit: 50
-        });
-        const data = jsonGETNoThrow(url);
-        if (!data) { this.hasMore = false; this.results = []; return this; }
-        const list = data.videos || data.data || [];
-        this.results = list.map(toPlatformVideo);
-        const pagination = data.pagination || {};
-        this.hasMore = pagination.hasNext === true || this.results.length >= 50;
-        return this;
-    }
-}
-
-class PlaylistsApiPager extends PlaylistPager {
-    constructor(query) {
-        super([], true);
-        this.query = query;
-        this.page = 0;
-        this.seen = {};
-        this.nextPage();
-    }
-    nextPage() {
-        this.page++;
-        // Use `page` (not the ignored `index`) so playlist search actually
-        // advances instead of returning page 1 over and over.
-        const url = BASE_URL + "/api/playlists/search" + buildQuery({
-            q: this.query, page: this.page, limit: 20
-        });
-        const data = jsonGETNoThrow(url);
-        const list = (data && data.data) || [];
-        const out = [];
-        for (let i = 0; i < list.length; i++) {
-            const p = list[i];
-            if (!p || !p._id || this.seen[p._id]) continue;
-            this.seen[p._id] = true;
-            out.push(toPlatformPlaylist(p));
-        }
-        this.results = out;
-        const meta = (data && data.meta) || {};
-        if (typeof meta.hasMore === "boolean") this.hasMore = meta.hasMore;
-        else this.hasMore = list.length >= 20;
-        return this;
-    }
-}
-
-// Lists the playlists created by a single profile owner. `owner` may be a
-// username or a 24-char user id — pmvhaven's /api/playlists?owner= accepts both.
-class ChannelPlaylistsPager extends PlaylistPager {
-    constructor(owner) {
-        super([], true);
-        this.owner = owner;
-        this.page = 0;
-        this.seen = {};
-        this.nextPage();
-    }
-    nextPage() {
-        this.page++;
-        const url = BASE_URL + "/api/playlists" + buildQuery({
-            owner: this.owner, page: this.page, limit: 30, sort: "-createdAt"
-        });
-        const data = jsonGETNoThrow(url);
-        const list = (data && data.data) || [];
-        const out = [];
-        for (let i = 0; i < list.length; i++) {
-            const p = list[i];
-            if (!p || !p._id || this.seen[p._id]) continue;
-            // The unauthenticated owner endpoint also returns private playlists;
-            // only surface public ones on a profile's Playlists tab.
-            if (p.isPublic === false) continue;
-            this.seen[p._id] = true;
-            out.push(toPlatformPlaylist(p));
-        }
-        this.results = out;
-        const meta = (data && data.meta) || {};
-        if (typeof meta.hasMore === "boolean") this.hasMore = meta.hasMore;
-        else this.hasMore = list.length >= 30;
-        return this;
-    }
-}
-
-class VideoCommentPager extends CommentPager {
-    constructor(videoUrl, videoId, page) {
-        super([], true);
-        this.videoUrl = videoUrl;
-        this.videoId = videoId;
-        this.page = page || 1;
-        this._loadPage();
-    }
-    _loadPage() {
-        const url = BASE_URL + "/api/videos/" + this.videoId + "/comments" + buildQuery({
-            index: this.page, limit: 50
-        });
-        const data = jsonGETNoThrow(url);
-        const list = (data && data.data) || [];
-        const filtered = list.filter(c => !c.shadowBanned);
-        this.results = filtered.map(c => buildComment(c, this.videoUrl, this.videoId, null));
-        // Honour real pagination metadata when the API returns it
-        const p = data && data.pagination;
-        if (p && typeof p.hasNext === "boolean") this.hasMore = p.hasNext;
-        else if (p && typeof p.totalPages === "number") this.hasMore = this.page < p.totalPages;
-        else this.hasMore = filtered.length >= 50;
-    }
-    nextPage() {
-        this.page++;
-        this._loadPage();
-        return this;
-    }
-}
-
-log("PMVHaven plugin loaded");
+log("LOADED");
