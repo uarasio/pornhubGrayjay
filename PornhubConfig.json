@@ -1,84 +1,42 @@
 {
-	"name": "PornHub",
-	"description": "PornHub plugin for Grayjay - search, channels, comments, recommendations, login, history & migration",
-	"author": "mr. X",
-	"authorUrl": "",
-	"platformUrl": "https://www.pornhub.com",
+  "name": "PMVHaven",
+  "description": "PMVHaven plugin for Grayjay - channels, search, comments, recommendations, login, history & migration",
+  "author": "uarasio",
+  "authorUrl": "https://github.com/uarasio",
+  "platformUrl": "https://pmvhaven.com",
 
-	"sourceUrl": "https://raw.githubusercontent.com/uarasio/pornhubGrayjay/refs/heads/main/PornhubConfig.json",
-	"repositoryUrl": "https://github.com/uarasio/pornhubGrayjay/",
-	"scriptUrl": "./PornhubScript.js",
-	"version": 16,
+  "sourceUrl": "https://raw.githubusercontent.com/uarasio/HV-GJ/refs/heads/main/config.json",
+  "repositoryUrl": "https://github.com/uarasio/HV-GJ",
+  "scriptUrl": "./script.js",
+  "version": 33,
 
-	"scriptPublicKey": "",
-	"scriptSignature": "",
+  "iconUrl": "./logo.png",
+  "id": "03fb92a4-f857-4f45-a7bf-00c1660e75cb",
 
-	"iconUrl": "./pornhub.png",
-	"id": "dce06efc-862e-11ee-b9d1-0242ac120002",
+  "scriptSignature": "",
+  "scriptPublicKey": "",
+  "packages": ["Http", "DOMParser", "Utilities"],
 
-	"packages": ["Http", "DOMParser", "Utilities"],
-	"allowAllHttpHeaderAccess": true,
-	"allowEval": true,
-	"allowUrls": [
-		".pornhub.com",
-		"pornhub.com",
-		"www.pornhub.com",
-		"ev.phncdn.com",
-		".phncdn.com"
-	],
+  "allowEval": false,
+  "allowUrls": [
+    "pmvhaven.com",
+    ".pmvhaven.com",
+    "video.pmvhaven.com",
+    "storage.pmvhaven.com",
+    ".cloudflarestorage.com"
+  ],
+  "allowAllHttpHeaderAccess": false,
 
-	"authentication": {
-		"userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:143.0) Gecko/20100101 Firefox/143.0",
-		"loginUrl": "https://www.pornhub.com/login",
-		"cookiesToFind": ["il"],
-		"cookiesExclOthers": false
-	},
+  "authentication": {
+    "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "loginUrl": "https://pmvhaven.com/login",
+    "cookiesToFind": ["__Secure-better-auth.session_token"],
+    "cookiesExclOthers": false
+  },
 
-	"settings": [],
+  "settings": [],
 
-	"supportedClaimTypes": [3],
-	"primaryClaimFieldType": 3,
-	"subscriptionRateLimit": 60,
-
-	"changelog": {
-		"14": [
-			"Fix 404 / Failed-to-fetch on imported playlists: every http.GET call now passes useAuth=true so Grayjay's captured login cookies are attached;",
-			"Broader playlist-video parser (handles /likedvideos, /subscriptions, /playlist/watchlater and per-user lists which use slightly different markup);",
-			"Anchor-fallback playlist-list parser so /users/<id>/playlists tiles aren't missed;",
-			"More reliable user-path detection via /account redirect URL (covers accounts whose dropdown HTML differs);"
-		],
-		"13": [
-			"Fix import-empty bug: resolved canonical user path (e.g. /users/9fa60b0/) so subscription / playlist / history endpoints actually receive the correct user id;",
-			"Subscriptions import now aggregates User, Pornstar and Channel subscriptions (3 endpoints);",
-			"Playlists import now includes Favorites, Watch Later, Liked Videos and Subscriptions Feed as virtual playlists;",
-			"Fixed Favorites path (/videos/favorites, American spelling) and Watch Later path (/playlist/watchlater);",
-			"Watch history now uses /users/<id>/videos/recent;",
-			"Channel handling now also recognizes /users/<name>/ profiles so user-account subscriptions actually work;"
-		],
-		"12": [
-			"Added Sign-in support (Grayjay built-in login web view);",
-			"Added Import of subscribed pornstars / models / channels;",
-			"Added Import of user playlists, plus virtual Favorites & Watch Later;",
-			"Added Sync of remote watch history (Pornhub -> Grayjay);",
-			"Added Search filters: Date, Duration, Quality (HD), Production, Sort order;",
-			"Added Search types: Videos, Playlists, Creators;",
-			"Added Playlist URL handling and full playlist details;"
-		],
-		"11": [
-			"Fix playing videos, isChannelUrl check;",
-			"Fix loading some channels;"
-		],
-		"10": [
-			"Remove invalid Signature;",
-			"Added channel statistics to description (total videos, views, subscribers);",
-			"Implemented dynamic social media link extraction for channels, pornstars, and models;",
-			"Fixed country-specific subdomain handling;",
-			"Fixed author URLs in channel content to show full channel URL instead of username;",
-			"Implemented httpGET wrapper with automatic session management and bot detection bypass;",
-			"Increased retry attempts to 3 with 1-second delay between retries;",
-			"Added content recommendations;",
-			"Implemented shorts tab;",
-			"Fixed autocomplete search suggestions;"
-		]
-	}
+  "supportedClaimTypes": [3],
+  "primaryClaimFieldType": 3,
+  "subscriptionRateLimit": 60
 }
