@@ -11,7 +11,10 @@ var state = {
 	// Auth state populated by the login flow / isLoggedIn().
 	isAuthenticated: false,
 	username: "",
-	userId: ""
+	userId: "",
+	// URL-safe profile path like "9fa60b0" used in /users/<X>/... paths.
+	// Different from `username` (which is the display name from <meta USR>).
+	userPath: ""
 };
 var pluginSettings = {
 	syncRemoteHistory: true
@@ -74,7 +77,8 @@ source.enable = function (conf, settings, savedStateStr) {
 			state.isAuthenticated = !!s.isAuthenticated;
 			state.username = s.username || "";
 			state.userId = s.userId || "";
-			log("State loaded: token=" + (state.token ? "present" : "empty") + " auth=" + state.isAuthenticated);
+			state.userPath = s.userPath || "";
+			log("State loaded: token=" + (state.token ? "present" : "empty") + " auth=" + state.isAuthenticated + " userPath=" + state.userPath);
 		} catch (e) {
 			log("Failed to parse saved state: " + e);
 		}
@@ -92,6 +96,7 @@ source.disable = function () {
 	state.isAuthenticated = false;
 	state.username = "";
 	state.userId = "";
+	state.userPath = "";
 };
 
 source.setSettings = function (newsettings) {
@@ -108,7 +113,8 @@ source.saveState = function() {
 		sessionCookie: state.sessionCookie,
 		isAuthenticated: state.isAuthenticated,
 		username: state.username,
-		userId: state.userId
+		userId: state.userId,
+		userPath: state.userPath
 	});
 };
 
@@ -380,7 +386,7 @@ source.searchChannels = function (query) {
 
 
 source.isChannelUrl = function (url) {
-	return url.includes(".pornhub.com/model/") || url.includes(".pornhub.com/channels/") || url.includes(".pornhub.com/pornstar/");
+	return url.includes(".pornhub.com/model/") || url.includes(".pornhub.com/channels/") || url.includes(".pornhub.com/pornstar/") || /\.pornhub\.com\/users\/[^\/?#]+\/?$/.test(url);
 };
 
 source.getChannel = function (url) {
@@ -397,6 +403,7 @@ source.getChannel = function (url) {
 	if(url.includes("/channels/")) {
 		info = getChannelInfo(url);
 	} else {
+		// covers /pornstar/, /model/, /users/
 		info = getPornstarInfo(url);
 	}
 
@@ -423,6 +430,9 @@ source.getChannelContents = function (url, type, order, filters) {
 		return getChannelVideosPager(url + "/videos", {}, 1);
 	} else if(url.includes("/model/")){
 		return getModelVideosPager(url + "/videos", {}, 1);
+	} else if(url.includes("/users/")) {
+		// User-account profile videos -- e.g. /users/<name>/videos[?o=mr&page=N]
+		return getModelVideosPager(url.replace(/\/$/, "") + "/videos", {}, 1);
 	} else {
 		return getPornstarVideosPager(url + "/videos/upload", {}, 1);
 	}
@@ -2545,9 +2555,33 @@ function loadAuthCookies() {
 	return false;
 }
 
-// Parse the logged-in username from a fetched pornhub HTML page. Pornhub
-// exposes the current user via the top-bar dropdown (`a.username`) and via a
-// meta tag (`name="USR"`) on most pages.
+// Parse the URL-safe user path (like "9fa60b0") AND the display name from
+// the logged-in HTML. Pornhub exposes the current user at:
+//   <a href="/users/<userPath>/account">     -- profile dropdown
+//   <a href="/users/<userPath>/playlists">   -- header link
+//   <meta name="USR" content="<displayName>">
+// The userPath is what's used in all /users/<X>/... paths.
+function parseUserPathFromHtml(html) {
+	if (!html) return "";
+	var patterns = [
+		/href=["']\/users\/([a-zA-Z0-9_.-]{3,40})\/account\b/i,
+		/href=["']\/users\/([a-zA-Z0-9_.-]{3,40})\/playlists\b/i,
+		/href=["']\/users\/([a-zA-Z0-9_.-]{3,40})\/subscriptions\b/i,
+		/href=["']\/users\/([a-zA-Z0-9_.-]{3,40})\/pornstar_subscriptions\b/i,
+		/href=["']\/users\/([a-zA-Z0-9_.-]{3,40})\/channel_subscriptions\b/i,
+		/href=["']\/users\/([a-zA-Z0-9_.-]{3,40})\/videos\/favorites\b/i,
+		/href=["']\/users\/([a-zA-Z0-9_.-]{3,40})\/videos\/recent\b/i,
+		// Header dropdown: usernameLink / userMenu wrapping anchor
+		/<a[^>]+class=["'][^"']*usernameLink[^"']*["'][^>]+href=["']\/users\/([a-zA-Z0-9_.-]{3,40})/i,
+		/id=["']profileMenuDropdown["'][^>]*>[\s\S]{0,200}?href=["']\/users\/([a-zA-Z0-9_.-]{3,40})/i
+	];
+	for (var i = 0; i < patterns.length; i++) {
+		var m = html.match(patterns[i]);
+		if (m && m[1]) return m[1];
+	}
+	return "";
+}
+
 function parseUsernameFromHtml(html) {
 	try {
 		var dom = domParser.parseFromString(html);
@@ -2565,31 +2599,29 @@ function parseUsernameFromHtml(html) {
 				return name;
 			}
 		}
-		// fallback: look for /users/<name>/ link in header
-		var profileLink = dom.querySelector("a[href*='/users/'][href*='/account']");
-		if (profileLink) {
-			var href = profileLink.getAttribute("href") || "";
-			var m = href.match(/\/users\/([^\/\?#]+)/);
-			if (m) return m[1];
-		}
 	} catch (e) { /* ignore */ }
 	return "";
 }
 
-// Authoritative session probe: fetch the home page (which renders different
-// HTML depending on auth) and extract the logged-in username. Populates
-// state.username when successful.
+// Authoritative session probe: fetch a logged-in page and extract BOTH the
+// display name (state.username) and the URL-safe user path (state.userPath).
+// state.userPath is what's used in /users/<X>/... URLs.
 function validateSession() {
 	try {
-		var resp = http.GET(URL_BASE + "/front", headers, true);
-		if (!resp || !resp.isOk) {
-			resp = http.GET(URL_BASE + "/", headers, true);
-		}
-		if (!resp || !resp.isOk) return false;
-		var u = parseUsernameFromHtml(resp.body);
-		if (u) {
-			state.username = u;
-			return true;
+		var paths = ["/front_page", "/", "/account"];
+		for (var i = 0; i < paths.length; i++) {
+			var resp;
+			try { resp = http.GET(URL_BASE + paths[i], headers, true); } catch (e) { continue; }
+			if (!resp || !resp.isOk) continue;
+			var body = resp.body || "";
+			var p = parseUserPathFromHtml(body);
+			var u = parseUsernameFromHtml(body);
+			if (p) state.userPath = p;
+			if (u) state.username = u;
+			if (p || u) {
+				log("validateSession: userPath=" + state.userPath + " username=" + state.username);
+				return !!(p || u);
+			}
 		}
 	} catch (e) { log("validateSession error: " + e); }
 	return false;
@@ -2609,7 +2641,7 @@ source.isLoggedIn = function () {
 		if (bridgeIsLoggedIn()) {
 			loadAuthCookies();
 			state.isAuthenticated = true;
-			if (!state.username) validateSession();
+			if (!state.userPath || !state.username) validateSession();
 			return true;
 		}
 		loadAuthCookies();
@@ -2629,7 +2661,7 @@ source.getLoggedInUser = function () {
 	try {
 		if (!source.isLoggedIn()) return null;
 		if (!state.username) validateSession();
-		return state.username || "Logged In";
+		return state.username || state.userPath || "Logged In";
 	} catch (e) { return null; }
 };
 
@@ -2653,6 +2685,7 @@ source.prepareLogin = function () {
 		state.isAuthenticated = false;
 		state.username = "";
 		state.userId = "";
+		state.userPath = "";
 		// Reset cookie string to the public defaults so the next login is fresh.
 		headers["Cookie"] = "platform=pc; accessAgeDisclaimerPH=2";
 		try {
@@ -2676,6 +2709,7 @@ source.logout = function () {
 	state.isAuthenticated = false;
 	state.username = "";
 	state.userId = "";
+	state.userPath = "";
 	headers["Cookie"] = "platform=pc; accessAgeDisclaimerPH=2";
 	try {
 		if (typeof http.clearCookies === "function") {
@@ -2696,6 +2730,9 @@ source.logout = function () {
 source.isPlaylistUrl = function (url) {
 	if (!url) return false;
 	if (isVirtualPlaylistUrl(url)) return true;
+	if (/\/playlist\/watchlater\b/.test(url)) return true;
+	if (/\/likedvideos\b/.test(url)) return true;
+	if (/\/subscriptions\b/.test(url) && !/\/users\//.test(url)) return true;
 	return /^https?:\/\/(?:[a-z]{2}\.)?(?:www\.)?pornhub\.com\/playlist\/\d+/.test(url);
 };
 
@@ -2806,6 +2843,12 @@ source.getPlaylist = function (url) {
 	if (isVirtualPlaylistUrl(url)) {
 		return getVirtualPlaylistDetails(url);
 	}
+	// Map non-numeric virtual URLs to the right kind so the user can paste
+	// them directly into Grayjay.
+	if (/\/playlist\/watchlater\b/.test(url)) return getVirtualPlaylistDetails(VPL_WATCH_LATER_URL);
+	if (/\/likedvideos\b/.test(url)) return getVirtualPlaylistDetails(VPL_LIKED_URL);
+	if (/\/subscriptions\b/.test(url) && !/\/users\//.test(url)) return getVirtualPlaylistDetails(VPL_SUBS_FEED_URL);
+
 	var id = _extractPlaylistIdFromUrl(url);
 	if (!id) throw new ScriptException("Invalid playlist URL: " + url);
 
@@ -2909,38 +2952,42 @@ class PornhubPlaylistsPager extends PlaylistPager {
 }
 
 // ====================================================================
-// Virtual playlists (Favorites, Watch Later) -- session scoped
+// Virtual playlists  (Favorites, Watch Later, Liked Videos, Subs Feed)
 // ====================================================================
+// All four show up under "Import Playlists" in Grayjay. URLs match the
+// canonical pornhub URLs so that opening them in a browser still works.
 
-const VPL_FAVORITES   = URL_BASE + "/__pornhub__/favorites";
-const VPL_WATCH_LATER = URL_BASE + "/__pornhub__/watch-later";
+function _vplFavoritesUrl() {
+	var p = state.userPath || "0";
+	return URL_BASE + "/users/" + encodeURIComponent(p) + "/videos/favorites";
+}
+const VPL_WATCH_LATER_URL = URL_BASE + "/playlist/watchlater";
+const VPL_LIKED_URL       = URL_BASE + "/likedvideos";
+const VPL_SUBS_FEED_URL   = URL_BASE + "/subscriptions";
 
 function isVirtualPlaylistUrl(url) {
-	return url === VPL_FAVORITES || url === VPL_WATCH_LATER;
+	if (!url) return false;
+	if (url === VPL_WATCH_LATER_URL) return true;
+	if (url === VPL_LIKED_URL) return true;
+	if (url === VPL_SUBS_FEED_URL) return true;
+	if (/\/users\/[^\/]+\/videos\/favorites\b/.test(url)) return true;
+	return false;
 }
 
-function _fetchVirtualPlaylistVideos(kind) {
-	// kind: "favorites" | "watch-later"
-	// Pornhub exposes per-user lists at:
-	//   Favorites:   /users/<username>/videos/favourites?page=N
-	//                (alternate alias: /my/favorites/videos)
-	//   Watch Later: /playlist/watch-later (a special server-side playlist)
-	if (!state.username) validateSession();
-	var basePath;
-	if (kind === "favorites") {
-		basePath = state.username
-			? ("/users/" + encodeURIComponent(state.username) + "/videos/favourites")
-			: "/my/favorites/videos";
-	} else {
-		basePath = state.username
-			? ("/users/" + encodeURIComponent(state.username) + "/videos/watch-later")
-			: "/playlist/watch-later";
-	}
+function virtualPlaylistKindFromUrl(url) {
+	if (url === VPL_WATCH_LATER_URL) return "watchlater";
+	if (url === VPL_LIKED_URL) return "liked";
+	if (url === VPL_SUBS_FEED_URL) return "subs";
+	if (/\/users\/[^\/]+\/videos\/favorites\b/.test(url)) return "favorites";
+	return null;
+}
+
+function _fetchVirtualPlaylistVideos(basePath) {
 	var out = [];
 	for (var page = 1; page <= 50; page++) {
 		var url = URL_BASE + basePath + buildQuery({ page: page });
 		var html;
-		try { html = httpGET(url, {}); } catch (e) { log("virtualPL " + kind + " p" + page + " err: " + e); break; }
+		try { html = httpGET(url, {}); } catch (e) { log("virtualPL " + basePath + " p" + page + ": " + e); break; }
 		var parsed = _parsePlaylistVideos(html);
 		if (!parsed.videos.length) break;
 		for (var i = 0; i < parsed.videos.length; i++) out.push(parsed.videos[i]);
@@ -2951,12 +2998,26 @@ function _fetchVirtualPlaylistVideos(kind) {
 
 function getVirtualPlaylistDetails(url) {
 	if (!source.isLoggedIn()) throw new ScriptException("Login required for " + url);
-	var kind = (url === VPL_FAVORITES) ? "favorites" : "watch-later";
-	var videos = _fetchVirtualPlaylistVideos(kind);
-	var name = (kind === "favorites") ? "Favorites" : "Watch Later";
+	var kind = virtualPlaylistKindFromUrl(url);
+	var name, basePath;
+	switch (kind) {
+		case "favorites":
+			if (!state.userPath) validateSession();
+			if (!state.userPath) throw new ScriptException("Unable to resolve user path");
+			name = "Favorites"; basePath = "/users/" + encodeURIComponent(state.userPath) + "/videos/favorites"; break;
+		case "watchlater":
+			name = "Watch Later"; basePath = "/playlist/watchlater"; break;
+		case "liked":
+			name = "Liked Videos"; basePath = "/likedvideos"; break;
+		case "subs":
+			name = "Subscriptions Feed"; basePath = "/subscriptions"; break;
+		default:
+			throw new ScriptException("Unknown virtual playlist: " + url);
+	}
+	var videos = _fetchVirtualPlaylistVideos(basePath);
 	var author = state.username
 		? new PlatformAuthorLink(new PlatformID(PLATFORM, state.username, config.id),
-			state.username, URL_BASE + "/users/" + encodeURIComponent(state.username), "")
+			state.username, URL_BASE + "/users/" + encodeURIComponent(state.userPath || ""), "")
 		: new PlatformAuthorLink(new PlatformID(PLATFORM, "", config.id), "", "", "");
 	var pvids = videos.map(_videoToPlatformVideo);
 	return new PlatformPlaylistDetails({
@@ -2975,48 +3036,90 @@ function getVirtualPlaylistDetails(url) {
 // Subscription & playlist migration
 // ====================================================================
 
+function _parseProfileLinksFromHtml(html, sectionKind) {
+	// sectionKind: "user" | "pornstar" | "channel"
+	// Returns absolute pornhub URLs to the subscribed profile root.
+	var dom = domParser.parseFromString(html);
+	var out = [];
+	var seen = {};
+	var selector, urlPrefix, hrefRegex;
+	if (sectionKind === "pornstar") {
+		selector = "a[href^='/pornstar/']";
+		hrefRegex = /^\/pornstar\/([^\/\?#]+)\/?$/;
+		urlPrefix = "/pornstar/";
+	} else if (sectionKind === "channel") {
+		selector = "a[href^='/channels/']";
+		hrefRegex = /^\/channels\/([^\/\?#]+)\/?$/;
+		urlPrefix = "/channels/";
+	} else {
+		// regular user accounts subscribed to
+		selector = "a[href^='/users/']";
+		hrefRegex = /^\/users\/([^\/\?#]+)\/?$/;
+		urlPrefix = "/users/";
+	}
+	var anchors = dom.querySelectorAll(selector);
+	for (var i = 0; i < anchors.length; i++) {
+		var href = anchors[i].getAttribute("href") || "";
+		var m = href.match(hrefRegex);
+		if (!m) continue;
+		// Skip the current user's own profile.
+		if (sectionKind === "user" && state.userPath && m[1] === state.userPath) continue;
+		var name = m[1];
+		if (seen[name]) continue;
+		seen[name] = true;
+		out.push(URL_BASE + urlPrefix + name);
+	}
+	return out;
+}
+
+function _hasNextPornhubPage(html) {
+	if (!html) return false;
+	// Pornhub paginators: <li class="page_next"> or <a class="page_next">
+	if (/class=["'][^"']*page_next[^"']*["']/.test(html)) {
+		// only "next" if not disabled
+		return !/page_next[^"]*["'][^>]*disabled/.test(html);
+	}
+	return false;
+}
+
 source.getUserSubscriptions = function () {
 	try {
 		if (!source.isLoggedIn()) {
 			log("getUserSubscriptions: not logged in");
 			return [];
 		}
-		if (!state.username) validateSession();
-		var seen = {};
+		if (!state.userPath) validateSession();
+		if (!state.userPath) {
+			log("getUserSubscriptions: could not resolve userPath");
+			return [];
+		}
 		var out = [];
-		// Pornhub paginates subscriptions at /users/<name>/subscriptions?page=N
-		var paths = state.username
-			? [
-				"/users/" + encodeURIComponent(state.username) + "/subscriptions",
-				"/my/subscriptions"
-			]
-			: ["/my/subscriptions"];
-		for (var pi = 0; pi < paths.length && out.length === 0; pi++) {
-			var basePath = paths[pi];
+		var seen = {};
+		// Pornhub keeps three separate subscription lists; iterate all of them.
+		var sections = [
+			{ kind: "user",     base: "/users/" + encodeURIComponent(state.userPath) + "/subscriptions" },
+			{ kind: "pornstar", base: "/users/" + encodeURIComponent(state.userPath) + "/pornstar_subscriptions" },
+			{ kind: "channel",  base: "/users/" + encodeURIComponent(state.userPath) + "/channel_subscriptions" }
+		];
+		for (var si = 0; si < sections.length; si++) {
+			var sec = sections[si];
 			for (var page = 1; page <= 50; page++) {
-				var url = URL_BASE + basePath + buildQuery({ page: page });
+				var url = URL_BASE + sec.base + buildQuery({ page: page });
 				var html;
-				try { html = httpGET(url, {}); } catch (e) { log("getUserSubscriptions " + basePath + " p" + page + ": " + e); break; }
-				var dom = domParser.parseFromString(html);
-				// Match channel/model/pornstar links inside subscription tiles.
-				var anchors = dom.querySelectorAll("a[href^='/model/'], a[href^='/pornstar/'], a[href^='/channels/']");
-				var pageFound = 0;
-				for (var i = 0; i < anchors.length; i++) {
-					var href = anchors[i].getAttribute("href") || "";
-					// Only consume the canonical profile root, not sub-pages.
-					var m = href.match(/^\/(model|pornstar|channels)\/([^\/\?#]+)\/?$/);
-					if (!m) continue;
-					var key = m[1] + "/" + m[2];
-					if (seen[key]) continue;
-					seen[key] = true;
-					out.push(URL_BASE + "/" + key);
-					pageFound++;
+				try { html = httpGET(url, {}); } catch (e) { log("getUserSubscriptions " + sec.base + " p" + page + ": " + e); break; }
+				if (!html) break;
+				var found = _parseProfileLinksFromHtml(html, sec.kind);
+				var added = 0;
+				for (var k = 0; k < found.length; k++) {
+					var u = found[k];
+					if (seen[u]) continue;
+					seen[u] = true;
+					out.push(u);
+					added++;
 				}
-				if (pageFound === 0) break;
-				var pageNext = dom.querySelector("li.page_next a, a.page_next");
-				if (!pageNext) break;
-				var h = pageNext.getAttribute("href") || "";
-				if (!h || h === "#") break;
+				log("getUserSubscriptions " + sec.kind + " p" + page + ": +" + added + " (total " + out.length + ")");
+				if (!added) break;
+				if (!_hasNextPornhubPage(html)) break;
 			}
 		}
 		log("getUserSubscriptions: returning " + out.length + " channel(s)");
@@ -3033,26 +3136,28 @@ source.getUserPlaylists = function () {
 			log("getUserPlaylists: not logged in");
 			return [];
 		}
-		if (!state.username) validateSession();
+		if (!state.userPath) validateSession();
 		var seen = {};
 		var out = [];
-		// User-owned playlists at /users/<name>/playlists?page=N
-		var paths = state.username
-			? [
-				"/users/" + encodeURIComponent(state.username) + "/playlists",
-				"/my/playlists"
-			]
-			: ["/my/playlists"];
-		for (var pi = 0; pi < paths.length && out.length === 0; pi++) {
-			var basePath = paths[pi];
-			for (var page = 1; page <= 20; page++) {
+		// User-owned playlists at /users/<id>/playlists?page=N
+		if (state.userPath) {
+			var basePath = "/users/" + encodeURIComponent(state.userPath) + "/playlists";
+			for (var page = 1; page <= 30; page++) {
 				var url = URL_BASE + basePath + buildQuery({ page: page });
 				var html;
-				try { html = httpGET(url, {}); } catch (e) { log("getUserPlaylists " + basePath + " p" + page + ": " + e); break; }
+				try { html = httpGET(url, {}); } catch (e) { log("getUserPlaylists p" + page + ": " + e); break; }
+				if (!html) break;
+				var added = 0;
 				var items = _parsePlaylistListItems(html);
-				if (!items.length) {
-					// Also try harvesting via direct anchor scan, in case the DOM
-					// shape on /users/<name>/playlists is different.
+				for (var i = 0; i < items.length; i++) {
+					var p = items[i];
+					if (!p.id || seen[p.id]) continue;
+					seen[p.id] = true;
+					out.push(_playlistUrlFromId(p.id));
+					added++;
+				}
+				if (!added) {
+					// Fallback: direct anchor scan
 					var dom2 = domParser.parseFromString(html);
 					var as = dom2.querySelectorAll("a[href*='/playlist/']");
 					for (var j = 0; j < as.length; j++) {
@@ -3062,25 +3167,20 @@ source.getUserPlaylists = function () {
 						if (seen[mm[1]]) continue;
 						seen[mm[1]] = true;
 						out.push(_playlistUrlFromId(mm[1]));
+						added++;
 					}
-					if (out.length === 0) break;
-					continue;
+					if (!added) break;
 				}
-				var added = 0;
-				for (var i = 0; i < items.length; i++) {
-					var p = items[i];
-					if (!p.id || seen[p.id]) continue;
-					seen[p.id] = true;
-					out.push(_playlistUrlFromId(p.id));
-					added++;
-				}
-				if (!added) break;
+				log("getUserPlaylists p" + page + ": +" + added + " (total " + out.length + ")");
+				if (!_hasNextPornhubPage(html)) break;
 			}
 		}
-		// Append virtual lists (always available when logged in).
-		out.push(VPL_FAVORITES);
-		out.push(VPL_WATCH_LATER);
-		log("getUserPlaylists: returning " + out.length + " playlist(s) (incl. Favorites + Watch Later)");
+		// Append the four virtual lists (always available when logged in).
+		out.push(_vplFavoritesUrl());
+		out.push(VPL_WATCH_LATER_URL);
+		out.push(VPL_LIKED_URL);
+		out.push(VPL_SUBS_FEED_URL);
+		log("getUserPlaylists: returning " + out.length + " playlist(s) (incl. Favorites/WatchLater/Liked/SubsFeed)");
 		return out;
 	} catch (e) {
 		log("getUserPlaylists error: " + e);
@@ -3132,32 +3232,24 @@ source.syncRemoteWatchHistory = function (continuationToken) {
 			log("syncRemoteWatchHistory: not logged in, skipping");
 			return new VideoPager([], false, { token: null });
 		}
-		if (!state.username) validateSession();
-
-		// Pornhub keeps "Recently watched" / "Watch history" at:
-		//   /my/recently-watched           (modern)
-		//   /users/<name>/videos/recent    (alternate / older URL)
-		var historyPaths = state.username
-			? [
-				"/users/" + encodeURIComponent(state.username) + "/videos/recent",
-				"/my/recently-watched"
-			]
-			: ["/my/recently-watched"];
+		if (!state.userPath) validateSession();
+		if (!state.userPath) {
+			log("syncRemoteWatchHistory: could not resolve userPath");
+			return new VideoPager([], false, { token: null });
+		}
+		var basePath = "/users/" + encodeURIComponent(state.userPath) + "/videos/recent";
 		var allItems = [];
-		for (var pi = 0; pi < historyPaths.length && allItems.length === 0; pi++) {
-			var basePath = historyPaths[pi];
-			for (var page = 1; page <= 50; page++) {
-				var url = URL_BASE + basePath + buildQuery({ page: page });
-				var html;
-				try { html = httpGET(url, {}); } catch (e) {
-					log("syncRemoteWatchHistory " + basePath + " p" + page + ": " + e);
-					break;
-				}
-				var parsed = _parsePlaylistVideos(html);
-				if (!parsed.videos.length) break;
-				for (var i = 0; i < parsed.videos.length; i++) allItems.push(parsed.videos[i]);
-				if (!parsed.hasNext) break;
+		for (var page = 1; page <= 50; page++) {
+			var url = URL_BASE + basePath + buildQuery({ page: page });
+			var html;
+			try { html = httpGET(url, {}); } catch (e) {
+				log("syncRemoteWatchHistory " + basePath + " p" + page + ": " + e);
+				break;
 			}
+			var parsed = _parsePlaylistVideos(html);
+			if (!parsed.videos.length) break;
+			for (var i = 0; i < parsed.videos.length; i++) allItems.push(parsed.videos[i]);
+			if (!parsed.hasNext) break;
 		}
 		if (!allItems.length) {
 			log("syncRemoteWatchHistory: no history found");

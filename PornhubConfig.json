@@ -8,7 +8,7 @@
 	"sourceUrl": "https://raw.githubusercontent.com/uarasio/pornhubGrayjay/refs/heads/main/PornhubConfig.json",
 	"repositoryUrl": "https://github.com/uarasio/pornhubGrayjay/",
 	"scriptUrl": "./PornhubScript.js",
-	"version": 12,
+	"version": 13,
 
 	"scriptPublicKey": "",
 	"scriptSignature": "",
@@ -41,6 +41,14 @@
 	"subscriptionRateLimit": 60,
 
 	"changelog": {
+		"13": [
+			"Fix import-empty bug: resolved canonical user path (e.g. /users/9fa60b0/) so subscription / playlist / history endpoints actually receive the correct user id;",
+			"Subscriptions import now aggregates User, Pornstar and Channel subscriptions (3 endpoints);",
+			"Playlists import now includes Favorites, Watch Later, Liked Videos and Subscriptions Feed as virtual playlists;",
+			"Fixed Favorites path (/videos/favorites, American spelling) and Watch Later path (/playlist/watchlater);",
+			"Watch history now uses /users/<id>/videos/recent;",
+			"Channel handling now also recognizes /users/<name>/ profiles so user-account subscriptions actually work;"
+		],
 		"12": [
 			"Added Sign-in support (Grayjay built-in login web view);",
 			"Added Import of subscribed pornstars / models / channels;",
