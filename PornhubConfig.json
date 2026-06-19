@@ -8,7 +8,7 @@
 	"sourceUrl": "https://raw.githubusercontent.com/uarasio/pornhubGrayjay/refs/heads/main/PornhubConfig.json",
 	"repositoryUrl": "https://github.com/uarasio/pornhubGrayjay/",
 	"scriptUrl": "./PornhubScript.js",
-	"version": 15,
+	"version": 14,
 
 	"scriptPublicKey": "",
 	"scriptSignature": "",
@@ -41,11 +41,6 @@
 	"subscriptionRateLimit": 60,
 
 	"changelog": {
-		"15": [
-			"Fix random playlists being imported: only scrape tiles inside the user's own playlists container (data-id required), not sidebar/featured widgets;",
-			"Fetch /users/<id>/playlists/public AND /users/<id>/playlists/private explicitly so neither tab is missed;",
-			"Preserve any pkey= token on private playlist URLs so they don't 404 when Grayjay re-fetches them;"
-		],
 		"14": [
 			"Fix 404 / Failed-to-fetch on imported playlists: every http.GET call now passes useAuth=true so Grayjay's captured login cookies are attached;",
 			"Broader playlist-video parser (handles /likedvideos, /subscriptions, /playlist/watchlater and per-user lists which use slightly different markup);",
