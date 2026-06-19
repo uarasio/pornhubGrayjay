@@ -2779,55 +2779,75 @@ function _playlistUrlFromId(id) {
 	return URL_BASE + "/playlist/" + id;
 }
 
-function _parsePlaylistListItems(html) {
-	// Parses a search-result / "all playlists" page. Pornhub varies the
-	// tile container class quite a bit between `/playlist/search`, the
-	// `/users/<id>/playlists` page and the home-page recommended row, so we
-	// try a broad selector and then fall back to an anchor-only scan that
-	// guarantees nothing is missed.
+function _parsePlaylistListItems(html, strict) {
+	// Parses a search-result / "all playlists" page.
+	//   strict=true   -> ONLY accept tiles that look like real user-owned
+	//                    playlist tiles (data-id / data-playlist-id, or a
+	//                    direct child anchor under the main playlists list).
+	//                    Used on /users/<id>/playlists/public|private so we
+	//                    don't accidentally import featured/recommended
+	//                    playlists shown in side widgets.
+	//   strict=false  -> Also fall back to a page-wide anchor scan. Used on
+	//                    /playlist/search where every tile IS a result.
 	var dom = domParser.parseFromString(html);
 	var out = [];
 	var seen = {};
-	var nodes = dom.querySelectorAll("li.pcVideoListItem, li.playlistLink, ul.user-playlist li, li.playlistsItem, li[data-playlist-id], li.videoBlock, li.videoblock, div.playlist");
-	for (var i = 0; i < nodes.length; i++) {
-		var li = nodes[i];
-		var id = li.getAttribute("data-id") || li.getAttribute("data-playlist-id");
-		var titleA = li.querySelector("a.title, span.title a, a.linkPlaylist, a.playlistTitle, a[href*='/playlist/']");
-		var href = titleA ? titleA.getAttribute("href") : "";
-		if (!id && href) {
-			var mm = href.match(/\/playlist\/(\d+)/);
-			if (mm) id = mm[1];
+	var nodes = dom.querySelectorAll("li.pcVideoListItem[data-id], li.pcVideoListItem[data-playlist-id], li.playlistsItem[data-id], li.playlistsItem[data-playlist-id], li[data-playlist-id]");
+	if (!nodes || !nodes.length) {
+		// Also accept tiles without data-id BUT only when they live inside a
+		// container that is clearly the user playlists list, not a sidebar.
+		var container = dom.querySelector("#profileUserPlaylists, #playlistContent, .profile-playlists, .user-playlists, ul.user-playlist, ul#singleFeedSection, ul#mostRecentVideosSection");
+		if (container) {
+			nodes = container.querySelectorAll("li.pcVideoListItem, li.playlistsItem, li.playlistLink, li.videoBlock, li.videoblock");
 		}
-		if (!id) continue;
-		if (seen[id]) continue;
-		seen[id] = true;
-		var name = titleA ? titleA.textContent.trim() : "";
-		if (!name) {
-			var alt = li.querySelector("img");
-			name = alt ? (alt.getAttribute("alt") || "") : "";
-		}
-		var img = li.querySelector("img");
-		var thumb = img ? (img.getAttribute("data-thumb_url") || img.getAttribute("data-src") || img.getAttribute("src") || "") : "";
-		var ownerA = li.querySelector(".usernameWrap a, a.usernameLink, a[href*='/users/'], a[href*='/model/'], a[href*='/pornstar/'], a[href*='/channels/']");
-		var ownerName = ownerA ? ownerA.textContent.trim() : "";
-		var ownerUrl = ownerA ? (URL_BASE + ownerA.getAttribute("href")) : "";
-		var countEl = li.querySelector(".videoCount, .videos, .videosNumber");
-		var videoCount = 0;
-		if (countEl) {
-			var n = parseInt((countEl.textContent || "").replace(/[^0-9]/g, ""));
-			if (!isNaN(n)) videoCount = n;
-		}
-		out.push({
-			id: id,
-			name: name || ("Playlist " + id),
-			thumbnail: thumb,
-			ownerName: ownerName,
-			ownerUrl: ownerUrl,
-			videoCount: videoCount
-		});
 	}
-	if (!out.length) {
-		// Fallback -- scan every anchor referencing a playlist id.
+	if (nodes && nodes.length) {
+		for (var i = 0; i < nodes.length; i++) {
+			var li = nodes[i];
+			var id = li.getAttribute("data-id") || li.getAttribute("data-playlist-id");
+			var titleA = li.querySelector("a.title, span.title a, a.linkPlaylist, a.playlistTitle, a[href*='/playlist/']");
+			var href = titleA ? titleA.getAttribute("href") : "";
+			if (!id && href) {
+				var mm = href.match(/\/playlist\/(\d+)/);
+				if (mm) id = mm[1];
+			}
+			if (!id) continue;
+			if (seen[id]) continue;
+			seen[id] = true;
+			var name = titleA ? titleA.textContent.trim() : "";
+			if (!name) {
+				var alt = li.querySelector("img");
+				name = alt ? (alt.getAttribute("alt") || "") : "";
+			}
+			var img = li.querySelector("img");
+			var thumb = img ? (img.getAttribute("data-thumb_url") || img.getAttribute("data-src") || img.getAttribute("src") || "") : "";
+			var ownerA = li.querySelector(".usernameWrap a, a.usernameLink, a[href*='/users/'], a[href*='/model/'], a[href*='/pornstar/'], a[href*='/channels/']");
+			var ownerName = ownerA ? ownerA.textContent.trim() : "";
+			var ownerUrl = ownerA ? (URL_BASE + ownerA.getAttribute("href")) : "";
+			var countEl = li.querySelector(".videoCount, .videos, .videosNumber");
+			var videoCount = 0;
+			if (countEl) {
+				var n = parseInt((countEl.textContent || "").replace(/[^0-9]/g, ""));
+				if (!isNaN(n)) videoCount = n;
+			}
+			// Preserve the full href so private playlists keep their pkey
+			// token (without which they 404).
+			var fullHref = (href && href.indexOf("/playlist/") >= 0)
+				? (href.startsWith("http") ? href : URL_BASE + href)
+				: "";
+			out.push({
+				id: id,
+				href: fullHref,
+				name: name || ("Playlist " + id),
+				thumbnail: thumb,
+				ownerName: ownerName,
+				ownerUrl: ownerUrl,
+				videoCount: videoCount
+			});
+		}
+	}
+	if (!out.length && !strict) {
+		// Fallback only when explicitly non-strict: scan every playlist anchor.
 		var anchors = dom.querySelectorAll("a[href*='/playlist/']");
 		for (var k = 0; k < anchors.length; k++) {
 			var hh = anchors[k].getAttribute("href") || "";
@@ -2840,6 +2860,7 @@ function _parsePlaylistListItems(html) {
 			var thumb2 = img2 ? (img2.getAttribute("data-thumb_url") || img2.getAttribute("data-src") || img2.getAttribute("src") || "") : "";
 			out.push({
 				id: pm[1],
+				href: hh.startsWith("http") ? hh : URL_BASE + hh,
 				name: ttxt || ("Playlist " + pm[1]),
 				thumbnail: thumb2,
 				ownerName: "",
@@ -2967,11 +2988,18 @@ source.getPlaylist = function (url) {
 	var id = _extractPlaylistIdFromUrl(url);
 	if (!id) throw new ScriptException("Invalid playlist URL: " + url);
 
+	// IMPORTANT: hit the ORIGINAL url (which may carry a `?pkey=...` token
+	// required for private playlists) rather than reconstructing it from id.
+	var fetchUrl = url;
+	if (!/^https?:\/\//.test(fetchUrl)) fetchUrl = URL_BASE + (fetchUrl.startsWith("/") ? fetchUrl : ("/" + fetchUrl));
 	var html;
 	try {
-		html = httpGET(URL_BASE + "/playlist/" + id, {});
+		html = httpGET(fetchUrl, {});
 	} catch (e) {
-		throw new ScriptException("Playlist fetch failed: " + e);
+		// Fallback: try the bare /playlist/<id> URL once in case the original
+		// had an invalid/expired token.
+		try { html = httpGET(URL_BASE + "/playlist/" + id, {}); }
+		catch (e2) { throw new ScriptException("Playlist fetch failed: " + e); }
 	}
 	var dom = domParser.parseFromString(html);
 
@@ -3035,7 +3063,7 @@ class PornhubPlaylistsPager extends PlaylistPager {
 		try {
 			var url = URL_BASE + "/playlist/search" + buildQuery({ search: this.query, page: this.page });
 			var html = httpGET(url, {});
-			var items = _parsePlaylistListItems(html);
+			var items = _parsePlaylistListItems(html, false /* allow anchor fallback for search results */);
 			var out = items.map(p => new PlatformPlaylist({
 				id: new PlatformID(PLATFORM, p.id, config.id),
 				name: p.name,
@@ -3044,7 +3072,7 @@ class PornhubPlaylistsPager extends PlaylistPager {
 					? new PlatformAuthorLink(new PlatformID(PLATFORM, p.ownerName, config.id), p.ownerName, p.ownerUrl, "")
 					: new PlatformAuthorLink(new PlatformID(PLATFORM, "", config.id), "", "", ""),
 				datetime: Math.floor(Date.now() / 1000),
-				url: _playlistUrlFromId(p.id),
+				url: p.href || _playlistUrlFromId(p.id),
 				videoCount: p.videoCount || 0
 			}));
 			this.results = out;
@@ -3254,40 +3282,35 @@ source.getUserPlaylists = function () {
 		if (!state.userPath) validateSession();
 		var seen = {};
 		var out = [];
-		// User-owned playlists at /users/<id>/playlists?page=N
+		// Pornhub user-owned playlists live at /users/<id>/playlists/<tab>
+		// where <tab> is "public" or "private". The plain /users/<id>/playlists
+		// page mixes in "Suggested Playlists" widgets, which would cause us to
+		// import random unrelated playlists. Hit the tabbed URLs explicitly so
+		// only the user's own playlists are scraped.
 		if (state.userPath) {
-			var basePath = "/users/" + encodeURIComponent(state.userPath) + "/playlists";
-			for (var page = 1; page <= 30; page++) {
-				var url = URL_BASE + basePath + buildQuery({ page: page });
-				var html;
-				try { html = httpGET(url, {}); } catch (e) { log("getUserPlaylists p" + page + ": " + e); break; }
-				if (!html) break;
-				var added = 0;
-				var items = _parsePlaylistListItems(html);
-				for (var i = 0; i < items.length; i++) {
-					var p = items[i];
-					if (!p.id || seen[p.id]) continue;
-					seen[p.id] = true;
-					out.push(_playlistUrlFromId(p.id));
-					added++;
-				}
-				if (!added) {
-					// Fallback: direct anchor scan
-					var dom2 = domParser.parseFromString(html);
-					var as = dom2.querySelectorAll("a[href*='/playlist/']");
-					for (var j = 0; j < as.length; j++) {
-						var href = as[j].getAttribute("href") || "";
-						var mm = href.match(/\/playlist\/(\d+)/);
-						if (!mm) continue;
-						if (seen[mm[1]]) continue;
-						seen[mm[1]] = true;
-						out.push(_playlistUrlFromId(mm[1]));
+			var tabs = ["/playlists/public", "/playlists/private", "/playlists"];
+			for (var ti = 0; ti < tabs.length; ti++) {
+				var basePath = "/users/" + encodeURIComponent(state.userPath) + tabs[ti];
+				for (var page = 1; page <= 30; page++) {
+					var url = URL_BASE + basePath + buildQuery({ page: page });
+					var html;
+					try { html = httpGET(url, {}); } catch (e) { log("getUserPlaylists " + basePath + " p" + page + ": " + e); break; }
+					if (!html) break;
+					var items = _parsePlaylistListItems(html, true /* strict */);
+					var added = 0;
+					for (var i = 0; i < items.length; i++) {
+						var p = items[i];
+						if (!p.id || seen[p.id]) continue;
+						seen[p.id] = true;
+						// Prefer the original href (preserves pkey tokens on
+						// private playlists; without it the playlist 404s).
+						out.push(p.href || _playlistUrlFromId(p.id));
 						added++;
 					}
+					log("getUserPlaylists " + basePath + " p" + page + ": +" + added + " (total " + out.length + ")");
 					if (!added) break;
+					if (!_hasNextPornhubPage(html)) break;
 				}
-				log("getUserPlaylists p" + page + ": +" + added + " (total " + out.length + ")");
-				if (!_hasNextPornhubPage(html)) break;
 			}
 		}
 		// Append the four virtual lists (always available when logged in).
