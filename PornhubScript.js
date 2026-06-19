@@ -877,7 +877,7 @@ function solveBotChallenge(html) {
 // 2.) cookies: __l, __s, and ss
 // this will allow you to get search suggestions!!
 function refreshSession() {
-	const resp = http.GET(URL_BASE, headers);
+	const resp = http.GET(URL_BASE, headers, true);
 	if (!resp.isOk)
 		throw new ScriptException("Failed request [" + URL_BASE + "] (" + resp.code + ")");
 	else {
@@ -2319,7 +2319,9 @@ function httpGET(url, options = {}) {
 
 			// Step 2: Make the HTTP request
 			log("httpGET: Fetching " + url + " (attempt " + (retries - attempts + 2) + "/" + (retries + 1) + ")");
-			const resp = http.GET(url, requestHeaders);
+			// Pass useAuth=true so Grayjay's captured login cookies (il, phn, ...)
+			// are attached -- without this every logged-in URL returns 404 / login-redirect.
+			const resp = http.GET(url, requestHeaders, true);
 
 			// Step 3: Check response status
 			if (!resp.isOk) {
@@ -2353,7 +2355,7 @@ function httpGET(url, options = {}) {
 				log("KEY cookie added, retrying request...");
 
 				// Retry the request with the KEY cookie
-				const retryResp = http.GET(url, requestHeaders);
+				const retryResp = http.GET(url, requestHeaders, true);
 
 				if (!retryResp.isOk) {
 					throw new ScriptException("Retry request [" + url + "] failed with code [" + retryResp.code + "]");
@@ -2608,21 +2610,48 @@ function parseUsernameFromHtml(html) {
 // state.userPath is what's used in /users/<X>/... URLs.
 function validateSession() {
 	try {
-		var paths = ["/front_page", "/", "/account"];
+		// /account redirects to /users/<userPath>/account when logged in, so
+		// the redirected URL itself encodes the answer. Try it first.
+		try {
+			var r0 = http.GET(URL_BASE + "/account", headers, true);
+			if (r0 && r0.url) {
+				var rm = r0.url.match(/\/users\/([a-zA-Z0-9_.-]{3,40})\b/);
+				if (rm && rm[1]) {
+					state.userPath = rm[1];
+					log("validateSession via /account redirect -> userPath=" + state.userPath);
+				}
+			}
+			if (r0 && r0.isOk) {
+				var body0 = r0.body || "";
+				if (!state.userPath) {
+					var p0 = parseUserPathFromHtml(body0);
+					if (p0) state.userPath = p0;
+				}
+				var u0 = parseUsernameFromHtml(body0);
+				if (u0) state.username = u0;
+			}
+		} catch (e0) { /* fall through */ }
+
+		if (state.userPath && state.username) return true;
+
+		var paths = ["/", "/front_page"];
 		for (var i = 0; i < paths.length; i++) {
 			var resp;
 			try { resp = http.GET(URL_BASE + paths[i], headers, true); } catch (e) { continue; }
 			if (!resp || !resp.isOk) continue;
 			var body = resp.body || "";
-			var p = parseUserPathFromHtml(body);
-			var u = parseUsernameFromHtml(body);
-			if (p) state.userPath = p;
-			if (u) state.username = u;
-			if (p || u) {
-				log("validateSession: userPath=" + state.userPath + " username=" + state.username);
-				return !!(p || u);
+			if (!state.userPath) {
+				var p = parseUserPathFromHtml(body);
+				if (p) state.userPath = p;
 			}
+			if (!state.username) {
+				var u = parseUsernameFromHtml(body);
+				if (u) state.username = u;
+			}
+			if (state.userPath && state.username) break;
 		}
+		log("validateSession: userPath=" + state.userPath + " username=" + state.username);
+		return !!(state.userPath || state.username);
 	} catch (e) { log("validateSession error: " + e); }
 	return false;
 }
@@ -2751,21 +2780,27 @@ function _playlistUrlFromId(id) {
 }
 
 function _parsePlaylistListItems(html) {
-	// Parses a search result page or "all playlists" page for playlists. Each
-	// playlist tile carries the data-id attribute and a thumbnail/title link.
+	// Parses a search-result / "all playlists" page. Pornhub varies the
+	// tile container class quite a bit between `/playlist/search`, the
+	// `/users/<id>/playlists` page and the home-page recommended row, so we
+	// try a broad selector and then fall back to an anchor-only scan that
+	// guarantees nothing is missed.
 	var dom = domParser.parseFromString(html);
 	var out = [];
-	var nodes = dom.querySelectorAll("li.pcVideoListItem, li.playlistLink, ul.user-playlist li, li.playlistsItem");
+	var seen = {};
+	var nodes = dom.querySelectorAll("li.pcVideoListItem, li.playlistLink, ul.user-playlist li, li.playlistsItem, li[data-playlist-id], li.videoBlock, li.videoblock, div.playlist");
 	for (var i = 0; i < nodes.length; i++) {
 		var li = nodes[i];
 		var id = li.getAttribute("data-id") || li.getAttribute("data-playlist-id");
-		var titleA = li.querySelector("a.title, span.title a, a.linkPlaylist, a.playlistTitle");
+		var titleA = li.querySelector("a.title, span.title a, a.linkPlaylist, a.playlistTitle, a[href*='/playlist/']");
 		var href = titleA ? titleA.getAttribute("href") : "";
 		if (!id && href) {
 			var mm = href.match(/\/playlist\/(\d+)/);
 			if (mm) id = mm[1];
 		}
 		if (!id) continue;
+		if (seen[id]) continue;
+		seen[id] = true;
 		var name = titleA ? titleA.textContent.trim() : "";
 		if (!name) {
 			var alt = li.querySelector("img");
@@ -2791,26 +2826,106 @@ function _parsePlaylistListItems(html) {
 			videoCount: videoCount
 		});
 	}
+	if (!out.length) {
+		// Fallback -- scan every anchor referencing a playlist id.
+		var anchors = dom.querySelectorAll("a[href*='/playlist/']");
+		for (var k = 0; k < anchors.length; k++) {
+			var hh = anchors[k].getAttribute("href") || "";
+			var pm = hh.match(/\/playlist\/(\d+)/);
+			if (!pm) continue;
+			if (seen[pm[1]]) continue;
+			seen[pm[1]] = true;
+			var ttxt = anchors[k].textContent.trim();
+			var img2 = anchors[k].querySelector("img");
+			var thumb2 = img2 ? (img2.getAttribute("data-thumb_url") || img2.getAttribute("data-src") || img2.getAttribute("src") || "") : "";
+			out.push({
+				id: pm[1],
+				name: ttxt || ("Playlist " + pm[1]),
+				thumbnail: thumb2,
+				ownerName: "",
+				ownerUrl: "",
+				videoCount: 0
+			});
+		}
+	}
 	return out;
 }
 
 function _parsePlaylistVideos(html) {
-	// Same DOM shape as the regular video lists.
+	// Pornhub renders the same video tile in many places but with slightly
+	// different `li`/`div` classes. Try the broadest selector first, then
+	// fall back to anything that looks like a video block (has data-video-id
+	// or an anchor pointing at view_video.php?viewkey=).
 	var dom = domParser.parseFromString(html);
 	var out = [];
-	var lis = dom.querySelectorAll("li.pcVideoListItem");
+	var seen = {};
+	var lis = dom.querySelectorAll("li.pcVideoListItem, li.videoBlock, li.videoblock, li[data-video-id], div.videoBlock[data-video-id]");
+	if (!lis || !lis.length) {
+		// Last resort: anchor scan -- find every viewkey on the page and
+		// rebuild minimal tiles from their surrounding markup.
+		var anchors = dom.querySelectorAll("a[href*='viewkey=']");
+		for (var a = 0; a < anchors.length; a++) {
+			var anc = anchors[a];
+			var href = anc.getAttribute("href") || "";
+			var keyMatch = href.match(/viewkey=([a-zA-Z0-9]+)/);
+			if (!keyMatch) continue;
+			var vid = keyMatch[1];
+			if (seen[vid]) continue;
+			seen[vid] = true;
+			var img = anc.querySelector("img");
+			var thumb = img ? (img.getAttribute("data-thumb_url") || img.getAttribute("data-src") || img.getAttribute("src") || "") : "";
+			var titleEl = anc.querySelector(".title, .thumbnailTitle, var.duration");
+			var title = (img && (img.getAttribute("alt") || img.getAttribute("data-title")))
+				|| anc.getAttribute("data-title")
+				|| anc.getAttribute("title")
+				|| (titleEl ? titleEl.textContent.trim() : "")
+				|| "";
+			var videoUrl = href.startsWith("http") ? href : (URL_BASE + href);
+			out.push({
+				id: vid,
+				name: title,
+				thumb: thumb,
+				duration: 0,
+				views: 0,
+				videoUrl: videoUrl,
+				authorName: "",
+				authorUrl: ""
+			});
+		}
+		var hasNextAnchor = dom.querySelector("li.page_next a, a.page_next, .pagination a[rel='next']");
+		var hasNextOnly = false;
+		if (hasNextAnchor) {
+			var hh = hasNextAnchor.getAttribute("href") || "";
+			if (hh && hh !== "#") hasNextOnly = true;
+		}
+		return { videos: out, hasNext: hasNextOnly };
+	}
 	for (var i = 0; i < lis.length; i++) {
 		var li = lis[i];
 		var videoId = li.getAttribute("data-video-id");
-		if (!videoId || isNaN(videoId)) continue;
-		var a = li.querySelector("a.js-linkVideoThumb, a.thumbnailTitle, a[href*='view_video']");
+		if (!videoId) {
+			// Try to extract from a child anchor with viewkey=
+			var a0 = li.querySelector("a[href*='viewkey=']");
+			if (a0) {
+				var h0 = a0.getAttribute("href") || "";
+				var km = h0.match(/viewkey=([a-zA-Z0-9]+)/);
+				if (km) videoId = km[1];
+			}
+		}
+		if (!videoId) continue;
+		if (seen[videoId]) continue;
+		seen[videoId] = true;
+		var a = li.querySelector("a.js-linkVideoThumb, a.thumbnailTitle, a[href*='view_video'], a[href*='viewkey=']");
 		if (!a) continue;
 		var videoUrl = a.getAttribute("href");
 		if (!videoUrl) continue;
 		if (!videoUrl.startsWith("http")) videoUrl = URL_BASE + videoUrl;
-		var img = li.querySelector("img");
-		var thumb = img ? (img.getAttribute("data-thumb_url") || img.getAttribute("data-src") || img.getAttribute("src") || "") : "";
-		var title = (img && (img.getAttribute("alt") || img.getAttribute("data-title"))) || a.getAttribute("data-title") || a.getAttribute("title") || "";
+		var img2 = li.querySelector("img");
+		var thumb2 = img2 ? (img2.getAttribute("data-thumb_url") || img2.getAttribute("data-src") || img2.getAttribute("src") || "") : "";
+		var title2 = (img2 && (img2.getAttribute("alt") || img2.getAttribute("data-title")))
+			|| a.getAttribute("data-title")
+			|| a.getAttribute("title")
+			|| "";
 		var dEl = li.querySelector("var.duration, .duration");
 		var dur = dEl ? parseDuration(dEl.textContent.trim()) : 0;
 		var vEl = li.querySelector(".views var, .views");
@@ -2820,8 +2935,8 @@ function _parsePlaylistVideos(html) {
 		var authorUrl = authorA ? (URL_BASE + authorA.getAttribute("href")) : "";
 		out.push({
 			id: videoId,
-			name: title,
-			thumb: thumb,
+			name: title2,
+			thumb: thumb2,
 			duration: dur,
 			views: views,
 			videoUrl: videoUrl,

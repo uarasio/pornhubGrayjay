@@ -8,7 +8,7 @@
 	"sourceUrl": "https://raw.githubusercontent.com/uarasio/pornhubGrayjay/refs/heads/main/PornhubConfig.json",
 	"repositoryUrl": "https://github.com/uarasio/pornhubGrayjay/",
 	"scriptUrl": "./PornhubScript.js",
-	"version": 13,
+	"version": 14,
 
 	"scriptPublicKey": "",
 	"scriptSignature": "",
@@ -41,6 +41,12 @@
 	"subscriptionRateLimit": 60,
 
 	"changelog": {
+		"14": [
+			"Fix 404 / Failed-to-fetch on imported playlists: every http.GET call now passes useAuth=true so Grayjay's captured login cookies are attached;",
+			"Broader playlist-video parser (handles /likedvideos, /subscriptions, /playlist/watchlater and per-user lists which use slightly different markup);",
+			"Anchor-fallback playlist-list parser so /users/<id>/playlists tiles aren't missed;",
+			"More reliable user-path detection via /account redirect URL (covers accounts whose dropdown HTML differs);"
+		],
 		"13": [
 			"Fix import-empty bug: resolved canonical user path (e.g. /users/9fa60b0/) so subscription / playlist / history endpoints actually receive the correct user id;",
 			"Subscriptions import now aggregates User, Pornstar and Channel subscriptions (3 endpoints);",
