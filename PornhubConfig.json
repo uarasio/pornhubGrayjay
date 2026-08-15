@@ -8,7 +8,7 @@
 	"sourceUrl": "https://raw.githubusercontent.com/uarasio/pornhubGrayjay/refs/heads/main/PornhubConfig.json",
 	"repositoryUrl": "https://github.com/uarasio/pornhubGrayjay/",
 	"scriptUrl": "./PornhubScript.js",
-	"version": 14,
+	"version": 15,
 
 	"scriptPublicKey": "",
 	"scriptSignature": "",
@@ -41,6 +41,13 @@
 	"subscriptionRateLimit": 60,
 
 	"changelog": {
+		"15": [
+			"Fix Android Picture-in-Picture (PiP) transport controls: the next-track, previous-track and \u00b110s skip buttons now appear and work, matching the YouTube plugin. Root cause: the current media item was being treated as non-VOD by ExoPlayer, so Grayjay's MediaSession stripped every transport command from the PiP action set;",
+			"Prefer progressive MP4 sources from flashvars.mediaDefinitions when available (always seekable / bounded, so the MediaSession keeps its full command set including SEEK_TO_NEXT / PREVIOUS_MEDIA_ITEM);",
+			"Coerce video duration to a numeric integer (seconds) on every PlatformVideoDetails / HLSSource / VideoUrlSource, with an ISO-8601 (ld+json) fallback;",
+			"Expose a top-level hls source on PlatformVideoDetails in addition to the VideoSourceDescriptor (mirrors the YouTube plugin);",
+			"Apply the same fixes to shorties playback."
+		],
 		"14": [
 			"Fix 404 / Failed-to-fetch on imported playlists: every http.GET call now passes useAuth=true so Grayjay's captured login cookies are attached;",
 			"Broader playlist-video parser (handles /likedvideos, /subscriptions, /playlist/watchlater and per-user lists which use slightly different markup);",

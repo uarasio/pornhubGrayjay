@@ -452,6 +452,23 @@ const supportedResolutions = {
 	'144': { width: 256, height: 144 }
 };
 
+/**
+ * Parse an ISO-8601 duration string (e.g. "PT1H2M34S") into whole seconds.
+ * Returns 0 if the string cannot be parsed.
+ * Used as a fallback when flashvars.video_duration is missing/invalid so
+ * PlatformVideoDetails always ships a numeric, non-zero duration - which is
+ * what Grayjay/ExoPlayer needs to advertise COMMAND_SEEK_* to Android PiP.
+ */
+function parseIso8601DurationToSeconds(iso) {
+	if (typeof iso !== "string") return 0;
+	var m = iso.match(/^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?$/);
+	if (!m) return 0;
+	var h = parseInt(m[1] || "0", 10);
+	var mi = parseInt(m[2] || "0", 10);
+	var s = parseInt(m[3] || "0", 10);
+	return h * 3600 + mi * 60 + s;
+}
+
 
 
 source.getContentDetails = function (url) {
@@ -465,25 +482,60 @@ source.getContentDetails = function (url) {
 	}
 
 	var mediaDefinitions = flashvars["mediaDefinitions"];
+
+	var dom = domParser.parseFromString(html);
+
+	var ldJson = JSON.parse(dom.querySelector('script[type="application/ld+json"]').text)
+
+	// Phase 2a: Force duration to a real integer (seconds).
+	// flashvars.video_duration is sometimes a string; fall back to ISO-8601
+	// duration from ld+json (e.g. "PT12M34S") and only then to 0.
+	var durationSec = parseInt(flashvars.video_duration, 10) || 0;
+	if (durationSec === 0 && ldJson && typeof ldJson.duration === "string") {
+		durationSec = parseIso8601DurationToSeconds(ldJson.duration);
+	}
+
 	var sources = [];
+	var hlsBest = null;
 
 	for (const mediaDefinition of mediaDefinitions) {
 		if (typeof mediaDefinition.defaultQuality !== "boolean") continue;
 		if (typeof mediaDefinition.quality === "object") continue;
 		var resolution = supportedResolutions[mediaDefinition.quality];
 		if (!resolution) continue;
-		sources.push(new HLSSource({
-			name: `${resolution.width}x${resolution.height}`,
-			url: mediaDefinition.videoUrl,
-			duration: flashvars.video_duration ?? 0,
-			priority: true,
-			requestModifier: { headers: { "Referer": URL_BASE + "/" } }
-		}));
+
+		// Phase 2c: Prefer progressive MP4 when available - always seekable,
+		// so Android PiP reliably exposes ±10s skip controls.
+		if (mediaDefinition.format === "mp4" && mediaDefinition.videoUrl) {
+			sources.push(new VideoUrlSource({
+				name: `${resolution.width}x${resolution.height}`,
+				url: mediaDefinition.videoUrl,
+				width: resolution.width,
+				height: resolution.height,
+				container: "video/mp4",
+				codec: "avc1",
+				bitrate: 0,
+				duration: durationSec,
+				priority: mediaDefinition.defaultQuality === true,
+				requestModifier: { headers: { "Referer": URL_BASE + "/" } }
+			}));
+			continue;
+		}
+
+		if (mediaDefinition.format === "hls" && mediaDefinition.videoUrl) {
+			var hlsSource = new HLSSource({
+				name: `${resolution.width}x${resolution.height}`,
+				url: mediaDefinition.videoUrl,
+				duration: durationSec,
+				priority: true,
+				requestModifier: { headers: { "Referer": URL_BASE + "/" } }
+			});
+			sources.push(hlsSource);
+			if (mediaDefinition.defaultQuality === true || hlsBest === null) {
+				hlsBest = hlsSource;
+			}
+		}
 	}
-
-	var dom = domParser.parseFromString(html);
-
-	var ldJson = JSON.parse(dom.querySelector('script[type="application/ld+json"]').text)
 
 	var description = ldJson.description;
 
@@ -523,12 +575,14 @@ source.getContentDetails = function (url) {
 			userAvatar ?? "",
 			subscribers ?? 0),
 		datetime: Math.round((new Date(ldJson.uploadDate)).getTime() / 1000),
-		duration: flashvars.video_duration,
+		duration: durationSec,
 		viewCount: views,
 		url: flashvars.link_url,
 		isLive: false,
+		live: false,
 		description: description,
 		video: new VideoSourceDescriptor(sources),
+		hls: hlsBest,
 		//subtitles: subtitles
 	});
 
@@ -721,10 +775,11 @@ function getShortsPager(from, count) {
 		const authorName = short.name || "";
 		const authorUrl = short.profileUrl || "";
 
-		// Calculate duration from mediaDefinitions if available
+		// Phase 2a: Force numeric duration for shorts too, so PiP treats the
+		// window as a bounded VOD.
 		var duration = 0;
 		if (short.trackingTimeWatched && short.trackingTimeWatched.video_duration) {
-			duration = short.trackingTimeWatched.video_duration;
+			duration = parseInt(short.trackingTimeWatched.video_duration, 10) || 0;
 		}
 
 		// Parse likes as views (shorties don't have view count)
@@ -740,19 +795,42 @@ function getShortsPager(from, count) {
 
 		// Extract video sources from mediaDefinitions
 		var sources = [];
+		var hlsBest = null;
 		if (short.mediaDefinitions && Array.isArray(short.mediaDefinitions)) {
 			short.mediaDefinitions.forEach(function (mediaDefinition) {
+				var quality = mediaDefinition.quality;
+				if (typeof quality === "object") return;
+				var resolution = supportedResolutions[quality];
+				if (!resolution) return;
+
+				// Phase 2c: Progressive MP4 first (always seekable => PiP skip works).
+				if (mediaDefinition.format === "mp4" && mediaDefinition.videoUrl) {
+					sources.push(new VideoUrlSource({
+						name: quality + "p",
+						url: mediaDefinition.videoUrl,
+						width: resolution.width,
+						height: resolution.height,
+						container: "video/mp4",
+						codec: "avc1",
+						bitrate: 0,
+						duration: duration,
+						priority: mediaDefinition.defaultQuality === true,
+						requestModifier: { headers: { "Referer": URL_BASE + "/" } }
+					}));
+					return;
+				}
+
 				if (mediaDefinition.format === "hls" && mediaDefinition.videoUrl) {
-					var quality = mediaDefinition.quality;
-					var resolution = supportedResolutions[quality];
-					if (resolution) {
-						sources.push(new HLSSource({
-							name: quality + "p",
-							url: mediaDefinition.videoUrl,
-							duration: duration,
-							priority: mediaDefinition.defaultQuality === true,
-							requestModifier: { headers: { "Referer": URL_BASE + "/" } }
-						}));
+					var hlsSource = new HLSSource({
+						name: quality + "p",
+						url: mediaDefinition.videoUrl,
+						duration: duration,
+						priority: mediaDefinition.defaultQuality === true,
+						requestModifier: { headers: { "Referer": URL_BASE + "/" } }
+					});
+					sources.push(hlsSource);
+					if (mediaDefinition.defaultQuality === true || hlsBest === null) {
+						hlsBest = hlsSource;
 					}
 				}
 			});
@@ -774,9 +852,11 @@ function getShortsPager(from, count) {
 				viewCount: views,
 				url: videoUrl.startsWith("http") ? videoUrl : URL_BASE + videoUrl,
 				isLive: false,
+				live: false,
 				isShort: true,
 				description: "",
 				video: new VideoSourceDescriptor(sources),
+				hls: hlsBest,
 				rating: new RatingLikes(parseInt(short.likeNumber) || 0)
 			}));
 		} else {
